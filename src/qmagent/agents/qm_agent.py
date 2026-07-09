@@ -130,22 +130,35 @@ class QMAgent(Agent):
         """Performs a series of geometry optimization simulations defined by the 
         coordinator agent. 
 
+        Stages run in order, each starting from the previous stage's optimized
+        geometry (e.g. a cheap pre-optimization followed by a higher-level
+        refinement). The final stage's geometry is written to disk and returned
+        with its energy.
+
         Arguments:
-            xyz_file (Path): Input compound to be optimized.
+            mol2_file (Path): Input compound to be optimized.
             output_path (Path): Output path for optimized compound.
             optimization_stages (list[QMConfig]): List of optimization stages
                 stored in a pydantic model. Attributes include basis, functional, 
-                dispersion, charge and multiplicity.
+                dispersion, charge and multiplicity. Must be non-empty.
             constraints (str | None): Defaults to None. Path to constraints file
                 which defines nuclei constraints for constrained optimization.
 
         Returns:
-            None
+            (GeomOptResult): The optimized geometry (xyz file) and final energy
+                from the last stage.
+
+        Raises:
+            ValueError: If ``optimization_stages`` is empty.
         """
+        if not optimization_stages:
+            raise ValueError('optimization_stages must contain at least one QMConfig stage.')
+
         contents = XYZContents.from_mol2(mol2_file)
         elements = contents.elements
         coords = contents.coords
 
+        e_final = None
         for optimization_stage in optimization_stages:
             geom_str = self.formulate_geometry_string(elements, coords)
 
@@ -169,7 +182,6 @@ class QMAgent(Agent):
 
         write_xyz(final_xyz, XYZContents(elements=elements, coords=coords))
 
-        # NOTE: needs error handling
         return GeomOptResult(xyz_file=final_xyz, energy=e_final)
 
     @action
@@ -276,33 +288,52 @@ class QMAgent(Agent):
                 supplies the element ordering and coordinates for the MK grid.
             mol2_file (Path): The model compound's mol2 file, used to detect
                 symmetry-equivalent atoms whose charges must be constrained equal.
-            esp_results (ESPResult): Gas- and solvent-phase ESP calculations, in
-                that order.
+            esp_results (ESPResult): Gas- and solvent-phase ESP calculations. The
+                phases are selected explicitly by each calculation's ``solvated``
+                flag, so their order within the set does not matter; exactly one
+                gas-phase and one solvent-phase calculation must be present.
             qm_config (QMConfig): QM settings; supplies the net charge.
             delta_resp2 (float): Defaults to 0.5. RESP2 solvent weighting delta.
 
         Returns:
             (RESPCharges): The interpolated RESP2 charges with metadata.
+
+        Raises:
+            ValueError: If the ESP set does not contain exactly one gas-phase and
+                one solvent-phase calculation.
         """
+        # Select phases by the solvated flag rather than positional order: the
+        # RESP2 interpolation q = delta*q_solv + (1-delta)*q_gas is meaningless
+        # if the two phases are swapped, and gather() preserves submission order,
+        # not semantic order.
+        gas = [c for c in esp_results if not c.solvated]
+        solv = [c for c in esp_results if c.solvated]
+        if len(gas) != 1 or len(solv) != 1:
+            raise ValueError(
+                'RESP2 requires exactly one gas-phase and one solvent-phase ESP '
+                f'calculation, got {len(gas)} gas and {len(solv)} solvent. '
+                'Re-run compute_ESP_charges to produce both phases.'
+            )
+        gas_esp, solv_esp = gas[0], solv[0]
+
         symmetry_pairs = self.find_symmetry_pairs(mol2_file)
         grid_pts = self.generate_mk_grid(molecule.elements, molecule.coords)
 
-        futures = []
-        for esp_result in esp_results:
-            futures.append(
-                asyncio.wrap_future(
-                    resp_app(
-                        xyz=molecule,
-                        qm_config=qm_config,
-                        esp=esp_result.esp_total,
-                        grid_pts=grid_pts,
-                        charge_constraints=None, # how do we propagate this information?
-                        symmetry_pairs=symmetry_pairs
-                    )
+        futures = {}
+        for phase, calc in (('gas', gas_esp), ('solv', solv_esp)):
+            futures[phase] = asyncio.wrap_future(
+                resp_app(
+                    xyz=molecule,
+                    qm_config=qm_config,
+                    esp=calc.esp_total,
+                    grid_pts=grid_pts,
+                    charge_constraints=None, # how do we propagate this information?
+                    symmetry_pairs=symmetry_pairs
                 )
             )
 
-        q_gas, q_solv = await asyncio.gather(*futures)
+        q_gas = await futures['gas']
+        q_solv = await futures['solv']
 
         q_resp2 = delta_resp2 * q_solv + (1 - delta_resp2) * q_gas
         assert np.isclose(q_resp2.sum(), qm_config.charge)

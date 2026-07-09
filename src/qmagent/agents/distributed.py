@@ -4,7 +4,6 @@ from pathlib import Path
 from ..utils.file_ops import XYZContents
 from ..utils.pydantic_models import (
     ESPCalculation,
-    GeomOptResult,
     OptimizationResult,
     QMConfig,
     TorsionFitResult,
