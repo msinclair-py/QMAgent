@@ -1,11 +1,15 @@
-"""Tests for the async @action input-validation guards on QMAgent that need no
-QM/parsl runtime.
+"""Tests for the async @action methods on QMAgent that need no QM/parsl runtime.
 
 The heavy @action coroutines (geometry_optimization, ESP, RESP, torsion scans)
-dispatch parsl apps that require PySCF/GPU/AmberTools, so they stay out of
-scope. What *is* testable without any of that: the guards that raise *before*
-any app is dispatched -- ``geometry_optimization``'s empty-stages guard and
-``fit_RESP_charges``'s gas/solvent phase-count guard.
+dispatch parsl apps that require PySCF/GPU/AmberTools, so they stay out of scope.
+What *is* testable without any of that:
+
+  * ``execute_code`` -- runs a snippet in a plain Python subprocess (no parsl),
+    so its I/O capture, working-directory, PYTHONPATH injection and timeout
+    behaviour can be exercised directly.
+  * the input-validation guards that raise *before* any app is dispatched:
+    ``geometry_optimization``'s empty-stages guard and ``fit_RESP_charges``'s
+    gas/solvent phase-count guard.
 
 These call the coroutines directly via ``asyncio.run`` (no pytest-asyncio
 plugin dependency); the @action decorator leaves the method awaitable as-is.
@@ -27,14 +31,104 @@ from qmagent.utils.pydantic_models import (
 
 @pytest.fixture
 def agent():
-    """A QMAgent instance. These guards touch no parsl runtime, so no
-    agent_on_startup / DataFlowKernel is needed."""
+    """A QMAgent instance. execute_code and the guards touch no parsl runtime,
+    so no agent_on_startup / DataFlowKernel is needed."""
     return QMAgent(num_threads=1)
 
 
 def _run(coro):
     """Drive an async @action to completion without a pytest-asyncio plugin."""
     return asyncio.run(coro)
+
+
+# --------------------------------------------------------------------------- #
+# execute_code
+# --------------------------------------------------------------------------- #
+
+def test_execute_code_success_captures_stdout(agent):
+    result = _run(agent.execute_code("print(6 * 7)"))
+    assert result["returncode"] == "0"
+    assert result["stdout"].strip() == "42"
+    assert result["stderr"] == ""
+
+
+def test_execute_code_success_with_no_output(agent):
+    result = _run(agent.execute_code("x = 1 + 1"))
+    assert result["returncode"] == "0"
+    assert result["stdout"] == ""
+    assert result["stderr"] == ""
+
+
+def test_execute_code_separates_stdout_and_stderr(agent, tmp_path):
+    # Write via a file to avoid shell-escaping newlines in the snippet.
+    snippet = (
+        "import sys\n"
+        "print('on stdout')\n"
+        "sys.stderr.write('on stderr')\n"
+    )
+    result = _run(agent.execute_code(snippet, workdir=tmp_path))
+    assert result["returncode"] == "0"
+    assert result["stdout"].strip() == "on stdout"
+    assert result["stderr"].strip() == "on stderr"
+
+
+def test_execute_code_exception_puts_traceback_in_stderr(agent):
+    result = _run(agent.execute_code("raise ValueError('boom')"))
+    # A raised exception must be a non-zero exit with the traceback on stderr.
+    assert result["returncode"] == "1"
+    assert "Traceback" in result["stderr"]
+    assert "ValueError" in result["stderr"]
+    assert "boom" in result["stderr"]
+    assert result["stdout"] == ""
+
+
+def test_execute_code_timeout_is_reported(agent):
+    result = _run(agent.execute_code("import time; time.sleep(30)", timeout=0.5))
+    assert result["returncode"] == "-1"
+    assert "timed out" in result["stderr"].lower()
+
+
+def test_execute_code_workdir_is_cwd(agent, tmp_path):
+    # A relative path written by the snippet must land inside workdir.
+    _run(agent.execute_code("open('artifact.txt', 'w').write('hi')", workdir=tmp_path))
+    assert (tmp_path / "artifact.txt").read_text() == "hi"
+
+
+def test_execute_code_creates_missing_workdir(agent, tmp_path):
+    target = tmp_path / "nested" / "run"
+    assert not target.exists()
+    result = _run(agent.execute_code("print('ok')", workdir=target))
+    assert result["returncode"] == "0"
+    assert target.is_dir()
+
+
+def test_execute_code_qmagent_importable(agent, tmp_path):
+    # The package root is injected into PYTHONPATH, so generated code can
+    # import the project even when run from an unrelated working directory.
+    snippet = (
+        "import qmagent.utils.file_ops as f\n"
+        "print('has_write_xyz', hasattr(f, 'write_xyz'))\n"
+    )
+    result = _run(agent.execute_code(snippet, workdir=tmp_path))
+    assert result["returncode"] == "0", result["stderr"]
+    assert "has_write_xyz True" in result["stdout"]
+
+
+def test_execute_code_extra_paths_importable(agent, tmp_path):
+    # A directory passed via extra_paths must be importable from the snippet.
+    helper_dir = tmp_path / "helpers"
+    helper_dir.mkdir()
+    (helper_dir / "my_helper.py").write_text("VALUE = 123\n")
+
+    result = _run(
+        agent.execute_code(
+            "import my_helper; print('value', my_helper.VALUE)",
+            workdir=tmp_path,
+            extra_paths=[helper_dir],
+        )
+    )
+    assert result["returncode"] == "0", result["stderr"]
+    assert "value 123" in result["stdout"]
 
 
 # --------------------------------------------------------------------------- #

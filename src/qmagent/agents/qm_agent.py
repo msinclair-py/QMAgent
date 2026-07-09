@@ -1,6 +1,6 @@
 import asyncio
-import asyncio
 import numpy as np
+import os
 import parsl
 from academy.agent import Agent, action
 from collections import defaultdict
@@ -513,6 +513,8 @@ class QMAgent(Agent):
     @action
     async def execute_code(self,
                            code_snippet: str,
+                           workdir: Path | None = None,
+                           extra_paths: list[Path] | None = None,
                            timeout: float = 300.0) -> dict[str, str]:
         """Code execution action. Used for performing bespoke analysis or simulation,
         entirely LLM agent driven. Initially here to allow the reasoning to sidestep
@@ -525,6 +527,13 @@ class QMAgent(Agent):
         ``sys.exit``, C-extension aborts) in the generated code and lets us reap
         the whole thing on timeout.
 
+        The subprocess runs with ``workdir`` as its current directory (so relative
+        paths the model writes land in the run's output directory, and it can read
+        the artifacts produced by earlier steps), and with the qmagent package root
+        plus any ``extra_paths`` (e.g. a skill's ``scripts/`` directory) prepended
+        to ``PYTHONPATH``. That lets generated code both ``import qmagent...`` and
+        import/execute the helper scripts shipped with the project skills.
+
         stdout and stderr are captured separately. On any failure -- a raised
         exception, a non-zero exit, or a timeout -- the reason (Python traceback,
         exit status, or timeout notice) lands in ``stderr`` so the LLM agent can
@@ -535,6 +544,12 @@ class QMAgent(Agent):
         Arguments:
             code_snippet (str): A multi-line string containing the python code to be
                 executed by the QMAgent.
+            workdir (Path | None): Defaults to None. Directory to run the snippet
+                in (typically the run's output directory). Created if missing;
+                falls back to the process cwd when None.
+            extra_paths (list[Path] | None): Defaults to None. Additional directories
+                to prepend to the subprocess ``PYTHONPATH`` (e.g. skill ``scripts/``
+                dirs) so their modules are importable from the snippet.
             timeout (float): Defaults to 300.0. Wall-clock seconds before the
                 subprocess is killed and reported as a timeout.
 
@@ -543,6 +558,25 @@ class QMAgent(Agent):
                 A non-zero ``returncode`` signals failure; any traceback is placed
                 in ``stderr``.
         """
+        if workdir is not None:
+            workdir = Path(workdir)
+            workdir.mkdir(parents=True, exist_ok=True)
+
+        # Build PYTHONPATH: qmagent package root (parent of the `qmagent` package
+        # dir, i.e. the `src` root) first, then any skill script dirs, then
+        # whatever the agent already had, so generated code can import the
+        # project and the skill helpers.
+        pkg_root = Path(__file__).resolve().parents[2]  # .../src
+        path_parts = [str(pkg_root)]
+        if extra_paths:
+            path_parts.extend(str(Path(p)) for p in extra_paths)
+        existing = os.environ.get('PYTHONPATH')
+        if existing:
+            path_parts.append(existing)
+
+        env = os.environ.copy()
+        env['PYTHONPATH'] = os.pathsep.join(path_parts)
+
         # Write to a real temp file rather than passing via ``-c`` so tracebacks
         # carry a stable filename and correct line numbers for the agent to read.
         with tempfile.NamedTemporaryFile(
@@ -556,6 +590,8 @@ class QMAgent(Agent):
                 sys.executable, script_path,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                cwd=str(workdir) if workdir is not None else None,
+                env=env,
             )
             try:
                 stdout_b, stderr_b = await asyncio.wait_for(

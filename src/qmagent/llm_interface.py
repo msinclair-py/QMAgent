@@ -155,6 +155,12 @@ async def run_code(ctx: RunContext[QMDeps], code: str) -> str:
     curated tools for one-off inspection, quick calculations, or glue work that
     no dedicated tool covers -- ``print`` whatever you need to see.
 
+    The snippet runs with the run's output directory as its working directory, so
+    relative paths resolve there and it can read artifacts produced by earlier
+    steps. The qmagent package and the ``scripts/`` directories of the project
+    skills are importable, so you can ``import qmagent...`` or reuse a skill's
+    helper scripts (e.g. ``from run_dft import ...``) directly.
+
     Arguments:
         code (str): A multi-line Python snippet. Anything it prints to stdout is
             returned to you; if it raises, the traceback comes back in stderr.
@@ -164,7 +170,19 @@ async def run_code(ctx: RunContext[QMDeps], code: str) -> str:
             is in the STDERR section -- read it to see why the code failed and
             revise the snippet.
     """
-    result = await ctx.deps.qm.execute_code(code)
+    # Make the project skills' helper scripts importable from the snippet, so the
+    # code-gen path can lean on the same vetted helpers the SkillsCapability
+    # surfaces (skills/<name>/scripts/*.py).
+    skills_root = Path('./skills')
+    extra_paths = sorted(
+        p for p in skills_root.glob('*/scripts') if p.is_dir()
+    ) if skills_root.is_dir() else []
+
+    result = await ctx.deps.qm.execute_code(
+        code,
+        workdir=ctx.deps.output_path,
+        extra_paths=extra_paths,
+    )
 
     stdout = result.get('stdout', '')
     stderr = result.get('stderr', '')
