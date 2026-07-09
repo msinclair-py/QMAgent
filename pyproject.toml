@@ -7,16 +7,36 @@ name = "qmagent"
 version = "0.1.0"
 description = "Agentic QM-derived force-field parameterization."
 requires-python = ">=3.12"
-# Runtime dependencies (rdkit, numpy, scipy, pydantic, parsl, academy, ...) are
-# not pinned here yet; they are currently provisioned into the environment
-# directly. Declare them here when the package is published.
-dependencies = []
+dependencies = [
+    # --- Scientific / cheminformatics core ---
+    "numpy>=2.5",
+    "scipy>=1.18",
+    "rdkit>=2026.3.3",
+    "pydantic>=2.13",
+
+    # --- Distributed execution (QMAgent worker side) ---
+    "academy-py>=0.5.0",   # imported as `academy`
+    "parsl>=2026.6.29",
+    "pyyaml>=6.0",
+
+    # --- LLM orchestration (pydantic-ai + ecosystem capabilities) ---
+    # pydantic-ai-slim is pulled transitively by pydantic-ai / the harness.
+    "pydantic-ai>=2.7",
+    "pydantic-ai-harness>=0.6.0",
+    "pydantic-ai-backend>=0.2.15",       # imported as `pydantic_ai_backends`
+    "summarization-pydantic-ai>=0.1.10", # imported as `pydantic_ai_summarization`
+    "pydantic-ai-shields>=0.3.4",
+    "pydantic-ai-skills>=1.1.0",
+    "pydantic-ai-todo>=0.2.6",
+    "pydantic-deep>=0.3.35",             # imported as `pydantic_deep`
+    "subagents-pydantic-ai>=0.2.8",
+]
 
 [project.optional-dependencies]
 # Dev/test dependencies. Install (editable) with uv:
 #   uv pip install -e '.[dev]'
 dev = [
-    "pytest>=8.0",
+    "pytest>=9.0",
 ]
 
 [tool.hatch.build.targets.wheel]
