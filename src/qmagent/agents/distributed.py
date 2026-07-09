@@ -259,7 +259,8 @@ def resp_app(xyz: XYZContents,
              esp: np.ndarray,
              grid_pts: np.ndarray,
              charge_constraints: list[tuple[list[int], float]] | None,
-             symmetry_pairs: list[tuple[int, int]] | None) -> np.ndarray:
+             symmetry_pairs: list[tuple[int, int]] | None,
+             refit_atoms: set[int] | None=None) -> np.ndarray:
     import numpy as np
     from .resp_fitter import RESPFitter
 
@@ -274,6 +275,7 @@ def resp_app(xyz: XYZContents,
         total_charge=qm_config.charge,
         charge_constraints=charge_constraints,
         symmetry_constraints=symmetry_pairs,
+        refit_atoms=refit_atoms,
     )
 
     return q

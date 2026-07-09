@@ -282,6 +282,11 @@ class QMAgent(Agent):
         RESP2(delta) interpolates between the two phases as
         delta * q_solv + (1 - delta) * q_gas, with each phase fit to its QM ESP
         on a shared Merz-Kollman grid under the molecule's symmetry equivalences.
+        Each phase's fit is itself the standard two-stage RESP: stage 1 fits every
+        atom under a weak restraint, then stage 2 freezes everything except
+        aliphatic (sp3) CH/CH2/CH3 carbons and their hydrogens -- identified from
+        the mol2 topology via ``find_resp_refit_atoms`` -- and refits only those
+        under a stronger restraint.
 
         Arguments:
             molecule (XYZContents): The optimized geometry the ESP was computed on;
@@ -317,6 +322,7 @@ class QMAgent(Agent):
         gas_esp, solv_esp = gas[0], solv[0]
 
         symmetry_pairs = self.find_symmetry_pairs(mol2_file)
+        refit_atoms = self.find_resp_refit_atoms(mol2_file)
         grid_pts = self.generate_mk_grid(molecule.elements, molecule.coords)
 
         futures = {}
@@ -328,7 +334,8 @@ class QMAgent(Agent):
                     esp=calc.esp_total,
                     grid_pts=grid_pts,
                     charge_constraints=None, # how do we propagate this information?
-                    symmetry_pairs=symmetry_pairs
+                    symmetry_pairs=symmetry_pairs,
+                    refit_atoms=refit_atoms,
                 )
             )
 
@@ -681,6 +688,44 @@ class QMAgent(Agent):
             break
 
         return symmetry_pairs
+
+    @staticmethod
+    def find_resp_refit_atoms(mol2: Path) -> set[int]:
+        """Identify the atoms RESP stage 2 is allowed to refit.
+
+        Standard two-stage RESP (Bayly et al. 1993, and its common implementations
+        e.g. Antechamber/resp) fits every atom in stage 1 under a weak restraint,
+        then in stage 2 freezes everything *except* aliphatic (sp3) CH/CH2/CH3
+        carbons and their attached hydrogens, which are refit under a stronger
+        restraint. Methyl/methylene charges are the most poorly determined by the
+        ESP (they sit in the molecular interior, far from most grid points) and
+        the least chemically informative, so they alone are allowed to move again
+        while every other charge (heteroatoms, sp2/aromatic carbons, polar
+        hydrogens) is locked at its stage-1 value.
+
+        Arguments:
+            mol2 (Path): Path to the input mol2 file for topology/hybridization.
+
+        Returns:
+            (set[int]): 0-indexed atoms (sp3 aliphatic carbons and their bonded
+                hydrogens) eligible for the stage-2 refit. All other atoms should
+                be frozen at their stage-1 charges.
+        """
+        mol = Chem.MolFromMol2File(str(mol2), removeHs=False, sanitize=True)
+
+        refit_atoms: set[int] = set()
+        for atom in mol.GetAtoms():
+            if (
+                atom.GetSymbol() == 'C'
+                and not atom.GetIsAromatic()
+                and atom.GetHybridization() == Chem.HybridizationType.SP3
+            ):
+                refit_atoms.add(atom.GetIdx())
+                for neighbor in atom.GetNeighbors():
+                    if neighbor.GetSymbol() == 'H':
+                        refit_atoms.add(neighbor.GetIdx())
+
+        return refit_atoms
 
     @staticmethod
     def generate_mk_grid(elements: list[str],

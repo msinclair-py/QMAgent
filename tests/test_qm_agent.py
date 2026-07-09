@@ -92,6 +92,65 @@ def test_find_symmetry_pairs_excludes_identity(ethane_mol2):
 
 
 # --------------------------------------------------------------------------- #
+# find_resp_refit_atoms
+# --------------------------------------------------------------------------- #
+
+def test_find_resp_refit_atoms_pure_alkane_refits_everything(ethane_mol2):
+    from rdkit import Chem
+
+    mol = Chem.MolFromMol2File(str(ethane_mol2), removeHs=False, sanitize=True)
+    refit = QMAgent.find_resp_refit_atoms(ethane_mol2)
+
+    # Ethane is nothing but sp3 carbons and their hydrogens, so every atom is
+    # eligible for the stage-2 refit.
+    assert refit == set(range(mol.GetNumAtoms()))
+
+
+def test_find_resp_refit_atoms_methanol_freezes_oxygen_and_its_hydrogen(methanol_mol2):
+    from rdkit import Chem
+
+    mol = Chem.MolFromMol2File(str(methanol_mol2), removeHs=False, sanitize=True)
+    refit = QMAgent.find_resp_refit_atoms(methanol_mol2)
+
+    carbon = next(a.GetIdx() for a in mol.GetAtoms() if a.GetSymbol() == "C")
+    oxygen = next(a.GetIdx() for a in mol.GetAtoms() if a.GetSymbol() == "O")
+    hydroxyl_h = next(
+        n.GetIdx() for n in mol.GetAtomWithIdx(oxygen).GetNeighbors()
+        if n.GetSymbol() == "H"
+    )
+    methyl_hs = {
+        n.GetIdx() for n in mol.GetAtomWithIdx(carbon).GetNeighbors()
+        if n.GetSymbol() == "H"
+    }
+
+    # Methyl carbon + its 3 hydrogens are refit; the hydroxyl O and its H are
+    # frozen (not sp3 carbon or a hydrogen bonded to one).
+    assert carbon in refit
+    assert methyl_hs <= refit
+    assert oxygen not in refit
+    assert hydroxyl_h not in refit
+
+
+def test_find_resp_refit_atoms_aromatic_ring_refits_nothing():
+    from rdkit import Chem
+    from rdkit.Chem import AllChem
+
+    from qmagent.utils.file_ops import write_mol2
+
+    mol = Chem.AddHs(Chem.MolFromSmiles("c1ccccc1"))
+    assert AllChem.EmbedMolecule(mol, randomSeed=42) == 0
+
+    import tempfile
+    path = Path(tempfile.mkdtemp()) / "benzene.mol2"
+    write_mol2(mol, path, "BNZ")
+
+    refit = QMAgent.find_resp_refit_atoms(path)
+
+    # No sp3 carbons in benzene -> nothing is eligible for the stage-2 refit.
+    assert refit == set()
+
+
+# --------------------------------------------------------------------------- #
 # merge_frcmods
 # --------------------------------------------------------------------------- #
 

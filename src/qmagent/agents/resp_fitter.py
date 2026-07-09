@@ -7,8 +7,11 @@ class RESPFitter:
 
     Implements the Bayly et al. (1993) RESP algorithm:
         Stage 1: Fit all atoms with weak hyperbolic restraint (a=0.0005)
-        Stage 2: Refit only non-polar CH/CH2/CH3 with stronger restraint (a=0.001)
-                  while freezing all other charges from stage 1.
+        Stage 2: Freeze every atom not in the caller-supplied refit set (see
+                 ``two_stage_resp``'s ``refit_atoms``; typically aliphatic
+                 CH/CH2/CH3 carbons and their hydrogens) at its stage-1 charge,
+                 and refit only the remaining atoms with stronger restraint
+                 (a=0.001).
 
     The ESP fitting functional:
         chi^2 = sum_k [ V_QM(r_k) - sum_i q_i / |r_k - R_i| ]^2
@@ -197,12 +200,29 @@ class RESPFitter:
         total_charge=0,
         charge_constraints=None,
         symmetry_constraints=None,
+        refit_atoms=None,
     ):
         """
         Full two-stage RESP fitting.
 
         Stage 1: Fit all atoms, a=0.0005
-        Stage 2: Freeze sp2 C, N, O, S and refit sp3 CH/CH2/CH3 with a=0.001
+        Stage 2: Freeze every atom not in ``refit_atoms`` at its stage-1 charge
+                 and refit only ``refit_atoms`` with a=0.001.
+
+        Arguments:
+            elements : list of str
+                Element symbols in atom-index order (kept for interface
+                compatibility / future per-element heuristics).
+            total_charge : float
+                Total molecular charge.
+            charge_constraints, symmetry_constraints :
+                Passed through to both stages (see ``fit``).
+            refit_atoms : set[int] | None
+                Atom indices eligible to move in stage 2 (typically aliphatic
+                CH/CH2/CH3 carbons and their hydrogens; see
+                ``QMAgent.find_resp_refit_atoms``). Every other atom is frozen
+                at its stage-1 charge. If None or empty, every atom is frozen
+                and stage 2 trivially returns the stage-1 charges.
         """
         # Stage 1
         print('  Stage 1: weak restraint (a=0.0005), all atoms free')
@@ -213,40 +233,36 @@ class RESPFitter:
             symmetry_constraints=symmetry_constraints,
         )
 
-        # Identify atoms to freeze in stage 2:
-        # - sp2 atoms (aromatic C, amide N, carbonyl O, C=O carbon)
-        # - Sulfur (typically only 1 bonding partner besides CH2)
-        # For simplicity, freeze everything except CH, CH2, CH3 hydrogens
-        # and the carbons they're bonded to.
-        # In practice: freeze everything that's not a methyl/methylene C or H
-
-        # Heuristic: freeze aromatic atoms, heteroatoms, and their H
-        freeze_in_stage2 = set()
-        for i, elem in enumerate(elements):
-            if elem in ('N', 'O', 'S'):
-                freeze_in_stage2.add(i)
-            # Aromatic carbons (we need the mol object for this, or use metadata)
-            # For now, freeze all non-CH3 atoms and let stage 2 refit methyl/methylene
-
-        # Actually, the standard RESP stage 2 only refits:
-        # - CH3 groups (methyl)
-        # - CH2 groups (methylene)
-        # - CH groups
-        # Everything else is frozen from stage 1.
-        # For this molecule, that means the S-CH2 and methyl cap CH3 groups.
-
         print(f'  Stage 1 charges: sum = {q1.sum():.6f}')
         print(f'  Stage 1 range: [{q1.min():.4f}, {q1.max():.4f}]')
 
-        # Stage 2: refit with stronger restraint
-        # In a full implementation, we would identify CH/CH2/CH3 from topology.
-        # Here we refit all atoms with stronger restraint for simplicity.
-        print('  Stage 2: stronger restraint (a=0.001)')
+        # Stage 2: freeze everything except the refit set (aliphatic CH/CH2/CH3
+        # carbons and their hydrogens by convention) at its stage-1 charge, and
+        # refit only the refit set with a stronger restraint. Frozen atoms are
+        # excluded from the symmetry/charge constraints too, since a constraint
+        # coupling a frozen and a free atom would either be trivially satisfied
+        # (both frozen) or over-determine the free atom.
+        refit = set(refit_atoms) if refit_atoms else set()
+        frozen_atoms = [i for i in range(self.natom) if i not in refit]
+        frozen_charges = {i: float(q1[i]) for i in frozen_atoms}
+
+        active_symmetry = [
+            (i, j) for (i, j) in (symmetry_constraints or [])
+            if i in refit and j in refit
+        ]
+        active_charge_constraints = [
+            (idx, tgt) for (idx, tgt) in (charge_constraints or [])
+            if all(a in refit for a in idx)
+        ]
+
+        print(f'  Stage 2: stronger restraint (a=0.001), refitting {len(refit)}/{self.natom} atoms')
         q2 = self.fit(
             total_charge=total_charge,
             restraint_a=0.001,
-            charge_constraints=charge_constraints,
-            symmetry_constraints=symmetry_constraints,
+            charge_constraints=active_charge_constraints,
+            symmetry_constraints=active_symmetry,
+            frozen_atoms=frozen_atoms,
+            frozen_charges=frozen_charges,
         )
 
         print(f'  Stage 2 charges: sum = {q2.sum():.6f}')
