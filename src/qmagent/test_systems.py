@@ -16,8 +16,8 @@ The ladder runs neutral -> charged and small -> larger:
 
 Run the whole ladder (from the repo root, as a module so relative imports work):
 
-    python -m agentic.test_systems
-    python -m agentic.test_systems --only NMA ALY     # subset by resname
+    python -m qmagent.test_systems
+    python -m qmagent.test_systems --only NMA ALY     # subset by resname
 """
 
 import argparse
