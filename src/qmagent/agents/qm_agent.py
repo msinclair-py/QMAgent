@@ -1,5 +1,5 @@
 import asyncio
-import io
+import asyncio
 import numpy as np
 import parsl
 from academy.agent import Agent, action
@@ -8,9 +8,8 @@ from parsl.config import Config
 from parsl.executors import ThreadPoolExecutor
 from pathlib import Path
 from rdkit import Chem
-import re
-import traceback
-from typing import Literal
+import sys
+import tempfile
 
 from .amber_apps import (
     get_lib_files,
@@ -481,42 +480,75 @@ class QMAgent(Agent):
         file_ops.mol2_to_sdf(mol2_file, sdf_file)
 
     @action
-    def execute_code(self,
-                     code_snippet: str,
-                     local_scope: dict={}) -> str:
+    async def execute_code(self,
+                           code_snippet: str,
+                           timeout: float = 300.0) -> dict[str, str]:
         """Code execution action. Used for performing bespoke analysis or simulation,
         entirely LLM agent driven. Initially here to allow the reasoning to sidestep
         the above curated actions if need be.
 
+        The snippet is written to a temporary file and executed in a fresh Python
+        subprocess (the same interpreter running the agent, so it shares the
+        agent's environment: rdkit, numpy, pyscf, ambertools bindings, etc.).
+        Running out-of-process isolates the agent from hard crashes (segfaults,
+        ``sys.exit``, C-extension aborts) in the generated code and lets us reap
+        the whole thing on timeout.
+
+        stdout and stderr are captured separately. On any failure -- a raised
+        exception, a non-zero exit, or a timeout -- the reason (Python traceback,
+        exit status, or timeout notice) lands in ``stderr`` so the LLM agent can
+        read why the code failed and revise it. On success ``stdout`` carries the
+        printed output (possibly empty) and ``stderr`` is whatever the snippet
+        wrote there (usually empty).
+
         Arguments:
             code_snippet (str): A multi-line string containing the python code to be
                 executed by the QMAgent.
+            timeout (float): Defaults to 300.0. Wall-clock seconds before the
+                subprocess is killed and reported as a timeout.
+
+        Returns:
+            (dict[str, str]): ``{'stdout': ..., 'stderr': ..., 'returncode': ...}``.
+                A non-zero ``returncode`` signals failure; any traceback is placed
+                in ``stderr``.
         """
-        old_stdout = sys.stdout
-        redirected_stdout = sys.stdout = io.StringIO()
+        # Write to a real temp file rather than passing via ``-c`` so tracebacks
+        # carry a stable filename and correct line numbers for the agent to read.
+        with tempfile.NamedTemporaryFile(
+            mode='w', suffix='.py', prefix='qm_exec_', delete=False,
+        ) as f:
+            f.write(code_snippet)
+            script_path = f.name
 
         try:
-            exec(code_snippet, {}, local_scope)
-            sys.stdout = old_stdout
-            return redirected_output.getvalue()
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable, script_path,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                stdout_b, stderr_b = await asyncio.wait_for(
+                    proc.communicate(), timeout=timeout
+                )
+            except asyncio.TimeoutError:
+                proc.kill()
+                # Drain the pipes so the killed child doesn't leave a zombie.
+                stdout_b, stderr_b = await proc.communicate()
+                stdout = stdout_b.decode('utf-8', errors='replace')
+                stderr = stderr_b.decode('utf-8', errors='replace')
+                timeout_msg = f'Execution timed out after {timeout:g}s and was killed.'
+                stderr = f'{stderr}\n{timeout_msg}'.strip() if stderr else timeout_msg
+                return {'stdout': stdout, 'stderr': stderr, 'returncode': '-1'}
 
-        except Exception as e:
-            sys.stdout = old_stdout
-            return traceback.format_exc(e)
-
-    @action
-    def examine_code(self, 
-                     code: str) -> str:
-        """Examine code looking for dangerous patterns (`rm -f *`) or injections.
-
-        Arguments:
-            code (str): The code snippet to examine.
-        """
-        pattern = re.compile('rm')
-
-        dangerous_patterns = re.findall(pattern, code)
-
-        return dangerous_patterns or ''
+            stdout = stdout_b.decode('utf-8', errors='replace')
+            stderr = stderr_b.decode('utf-8', errors='replace')
+            return {
+                'stdout': stdout,
+                'stderr': stderr,
+                'returncode': str(proc.returncode),
+            }
+        finally:
+            Path(script_path).unlink(missing_ok=True)
 
     @staticmethod
     def merge_frcmods(fits: list[TorsionFitResult],

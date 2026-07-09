@@ -147,16 +147,44 @@ orchestrator = PydanticAgent[QMDeps, ParameterizationSummary](
 
 @orchestrator.tool
 async def run_code(ctx: RunContext[QMDeps], code: str) -> str:
-    """"""
-    if dangerous_pattern := ctx.deps.qm.examine_code(code):
-        return dangerous_pattern
+    """Execute an arbitrary Python snippet on the QMAgent for bespoke analysis.
 
-    return_str = await ctx.deps.qm.execute_code(code)
+    The snippet runs in an isolated subprocess on the agent (sharing its
+    scientific environment: rdkit, numpy, pyscf, ambertools, etc.), so a crash
+    or hang in the code cannot take down the agent. Use this to sidestep the
+    curated tools for one-off inspection, quick calculations, or glue work that
+    no dedicated tool covers -- ``print`` whatever you need to see.
 
-    if 'Traceback' in return_str:
-        pass
+    Arguments:
+        code (str): A multi-line Python snippet. Anything it prints to stdout is
+            returned to you; if it raises, the traceback comes back in stderr.
 
-    return return_str
+    Returns:
+        (str): The captured stdout and stderr. On failure the Python traceback
+            is in the STDERR section -- read it to see why the code failed and
+            revise the snippet.
+    """
+    result = await ctx.deps.qm.execute_code(code)
+
+    stdout = result.get('stdout', '')
+    stderr = result.get('stderr', '')
+    returncode = result.get('returncode', '')
+
+    # returncode is the authoritative success signal: a raised exception exits
+    # non-zero with its traceback on stderr. stderr alone is not treated as
+    # failure -- libraries write benign warnings there on a clean (0) run.
+    if returncode not in ('', '0'):
+        raise ModelRetry(
+            f'Code execution failed (returncode {returncode}).\n'
+            f'--- STDOUT ---\n{stdout or "(empty)"}\n'
+            f'--- STDERR ---\n{stderr or "(empty)"}\n'
+            'Read the traceback above, fix the snippet, and try again.'
+        )
+
+    out = f'Code executed successfully (returncode {returncode}).\n--- STDOUT ---\n{stdout or "(empty)"}'
+    if stderr.strip():
+        out += f'\n--- STDERR (warnings) ---\n{stderr}'
+    return out
 
 @orchestrator.tool
 async def build_compound(ctx: RunContext[QMDeps], smiles: str, max_iters: int = 2000) -> str:
