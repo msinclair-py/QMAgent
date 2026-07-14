@@ -55,7 +55,7 @@ def geomopt_app(geom_str: str,
         from pyscf import dft
     from pyscf import lib
     from pyscf.geomopt.geometric_solver import optimize
-    from .distributed import load_dft
+    from .distributed import load_dft, _converge_scf
     from ..utils.pydantic_models import OptimizationResult
 
     lib.num_threads(num_threads)
@@ -82,7 +82,7 @@ def geomopt_app(geom_str: str,
     mf_final.xc = qm_config.functional
     mf_final.disp = qm_config.dispersion
     mf_final.grids.atom_grid = qm_config.grid_level
-    e_final = mf_final.kernel()
+    mf_final, e_final = _converge_scf(mf_final, 'geometry-optimization final point')
 
     return OptimizationResult(e_final=e_final, coords=opt_coords)
 
@@ -102,7 +102,7 @@ def esp_app(geom_str: str,
     """
     import numpy as np
     from pyscf import df, gto, lib
-    from .distributed import load_dft
+    from .distributed import load_dft, _converge_scf
     from ..utils.pydantic_models import ESPCalculation
 
     lib.num_threads(num_threads)
@@ -129,7 +129,8 @@ def esp_app(geom_str: str,
         mf.with_solvent.method = 'C-PCM'
         mf.with_solvent.eps = 78.3553
 
-    energy = mf.kernel()
+    phase = 'solvent' if solvated else 'gas'
+    mf, energy = _converge_scf(mf, f'ESP single point ({phase})')
 
     dm = mf.make_rdm1()
     # gpu4pyscf returns a CuPy density matrix, but the ESP integrals below run on
@@ -191,7 +192,7 @@ def scan_torsions_app(xyz: XYZContents,
     import numpy as np
     from pyscf import lib
     from pyscf.geomopt.geometric_solver import optimize
-    from .distributed import load_dft
+    from .distributed import load_dft, _converge_scf
     from .qm_agent import QMAgent
     from ..utils.file_ops import XYZContents, write_xyz
     from ..utils.pydantic_models import ScanPoint, TorsionScanResult
@@ -249,7 +250,10 @@ def scan_torsions_app(xyz: XYZContents,
             mf2.disp = qm_config.dispersion  # single dispersion source; see note above
             mf2.grids.atom_grid = qm_config.grid_level
 
-            energy = mf2.kernel()
+            # A non-converged point yields a garbage energy that would distort the
+            # torsion surface; _converge_scf raises on failure, which the except
+            # below turns into a (correctly flagged) incomplete scan.
+            mf2, energy = _converge_scf(mf2, f'torsion scan {angle:.1f} deg')
 
             coords = mol_opt.atom_coords(unit='Angstrom')
             
@@ -394,6 +398,40 @@ def fit_torsions_app(scan: TorsionScanResult,
         atom_types=(a, b, c, d),
         frcmod_file=frcmod_out if success else None,
     )
+
+def _converge_scf(mf, label: str):
+    """Run ``mf.kernel()`` and guarantee it converged.
+
+    A non-converged SCF still returns a number, which then silently corrupts
+    every downstream quantity (optimized energy, ESP, torsion surface). Following
+    the project's PySCF guidance, retry once with the second-order Newton solver
+    on failure, then raise if it still hasn't converged so bad numbers never
+    propagate. The Newton retry is guarded because not every gpu4pyscf mean-field
+    exposes ``.newton()``; if it doesn't, we still raise on non-convergence.
+
+    Arguments:
+        mf: A configured (but not yet run) PySCF/gpu4pyscf mean-field object.
+        label (str): Human-readable tag for the log/error message.
+
+    Returns:
+        A tuple ``(mf, energy)`` of the converged mean-field (possibly the Newton
+        object) and its total energy.
+
+    Raises:
+        RuntimeError: If the SCF fails to converge even after the Newton retry.
+    """
+    energy = mf.kernel()
+    if not getattr(mf, 'converged', True):
+        print(f'Warning: {label} SCF did not converge; retrying with Newton.')
+        try:
+            mf = mf.newton()
+            energy = mf.kernel()
+        except Exception as exc:  # noqa: BLE001 - newton may be absent on GPU
+            print(f'Warning: {label} Newton retry unavailable/failed: {exc}')
+        if not getattr(mf, 'converged', False):
+            raise RuntimeError(f'{label} SCF failed to converge.')
+    return mf, energy
+
 
 def load_dft(
     geom_str: str,
