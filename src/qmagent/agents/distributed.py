@@ -101,12 +101,17 @@ def esp_app(geom_str: str,
 
     lib.num_threads(num_threads)
 
+    # symmetry=False is required here: with symmetry=True PySCF reorients the
+    # molecule into its standard symmetry frame, so mol.atom_coords() (used for
+    # the nuclear term) would no longer align with the MK grid, which is built
+    # externally from the input coordinates. That misalignment silently corrupts
+    # the ESP -- worst on the symmetric systems (e.g. phosphate, trimethyl).
     mf = load_dft(
         geom_str=geom_str,
         qm_config=qm_config,
         verbose=verbose,
         max_memory=max_memory,
-        symmetry=True,
+        symmetry=False,
         gpu=True
     )
 
@@ -186,12 +191,15 @@ def scan_torsions_app(xyz: XYZContents,
     for angle in target_angles:
         geom_str = QMAgent.formulate_geometry_string(xyz.elements, xyz.coords)
 
+        # symmetry=False: a constrained (frozen-dihedral) optimization can lower
+        # the molecular point group mid-scan, so symmetry detection at build time
+        # is unsafe here and can crash or silently corrupt the geometry.
         mf = load_dft(
             geom_str=geom_str,
             qm_config=qm_config,
             verbose=verbose,
             max_memory=max_memory,
-            symmetry=True,
+            symmetry=False,
             gpu=True
         )
 
@@ -206,13 +214,10 @@ def scan_torsions_app(xyz: XYZContents,
             ]
         }
 
-        try:
-            from pyscf import dftd3
-            mf = dftd3.dftd3(mf)
-        except ImportError:
-            print('Warning: dftd3 not found - dispersion correction missing!')
-            pass
-
+        # Dispersion is applied once, via mf.disp set in load_dft (consistent with
+        # geomopt_app/esp_app). Do NOT also wrap with dftd3.dftd3(mf): that would
+        # double-count the correction and corrupt the very torsion energy surface
+        # paramfit is fit against.
         try:
             mol_opt = optimize(
                 mf,
@@ -223,14 +228,8 @@ def scan_torsions_app(xyz: XYZContents,
             mf2 = dft.RKS(mol_opt)
 
             mf2.xc = qm_config.functional
-            mf2.disp = qm_config.dispersion
+            mf2.disp = qm_config.dispersion  # single dispersion source; see note above
             mf2.grids.atom_grid = qm_config.grid_level
-
-            try:
-                from pyscf import dftd3
-                mf2 = dftd3.dftd3(mf2)
-            except ImportError:
-                pass
 
             energy = mf2.kernel()
 

@@ -91,6 +91,35 @@ def test_find_symmetry_pairs_excludes_identity(ethane_mol2):
     assert all(i != j for i, j in pairs)
 
 
+def test_find_symmetry_pairs_equalizes_whole_methyl(methanol_mol2):
+    from rdkit import Chem
+
+    # Regression guard for the canonical-rank fix: the three methyl hydrogens must
+    # be transitively connected by the emitted pairs (i.e. constrained to a single
+    # equal-charge class). A single graph automorphism could equate only two of
+    # the three; chaining consecutive members of the symmetry class must not.
+    mol = Chem.MolFromMol2File(str(methanol_mol2), removeHs=False, sanitize=True)
+    methyl_h = [
+        a.GetIdx() for a in mol.GetAtoms()
+        if a.GetSymbol() == "H"
+        and any(n.GetSymbol() == "C" for n in a.GetNeighbors())
+    ]
+    assert len(methyl_h) == 3
+
+    parent = {i: i for i in range(mol.GetNumAtoms())}
+
+    def find(x):
+        while parent[x] != x:
+            x = parent[x]
+        return x
+
+    for i, j in QMAgent.find_symmetry_pairs(methanol_mol2):
+        parent[find(i)] = find(j)
+
+    # All three methyl hydrogens collapse to one connected component.
+    assert len({find(h) for h in methyl_h}) == 1
+
+
 # --------------------------------------------------------------------------- #
 # find_resp_refit_atoms
 # --------------------------------------------------------------------------- #

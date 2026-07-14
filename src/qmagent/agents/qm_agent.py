@@ -666,26 +666,36 @@ class QMAgent(Agent):
     def find_symmetry_pairs(mol2: Path) -> list[tuple[int, int]]:
         """Find symmetry-equivalent atom pairs in the model compound.
         (E.g. the 3 hydrogens on a methyl group which must each have the same charge)
-        
+
+        Topologically equivalent atoms share a canonical rank when ties are left
+        unbroken (``Chem.CanonicalRankAtoms(mol, breakTies=False)``); every atom in
+        such a class must carry the same RESP charge. For each class we chain
+        consecutive members -- (a, b), (b, c), ... -- so transitivity through the
+        equal-charge constraints equalizes the *whole* class. The previous
+        implementation took a single graph automorphism and would miss members not
+        moved by that one permutation (e.g. it could equate only two of a methyl's
+        three hydrogens).
+
         Arguments:
             mol2 (Path): Path to the input mol2 file for checking symmetry
+
+        Returns:
+            (list[tuple[int, int]]): 0-indexed (i, j) pairs with i < j whose
+                charges must be constrained equal.
         """
         mol = Chem.MolFromMol2File(str(mol2), removeHs=False, sanitize=True)
 
-        matches = mol.GetSubstructMatches(mol, uniquify=False)
+        ranks = Chem.CanonicalRankAtoms(mol, breakTies=False)
 
-        symmetry_pairs = []
-        identity = tuple(range(mol.GetNumAtoms()))
+        classes: dict[int, list[int]] = defaultdict(list)
+        for idx, rank in enumerate(ranks):
+            classes[rank].append(idx)
 
-        for match in matches:
-            if match == identity:
-                continue
-            for i in range(mol.GetNumAtoms()):
-                j = match[i]
-                if i < j:
-                    symmetry_pairs.append((i, j))
-
-            break
+        symmetry_pairs: list[tuple[int, int]] = []
+        for members in classes.values():
+            members.sort()
+            for a, b in zip(members, members[1:]):
+                symmetry_pairs.append((a, b))
 
         return symmetry_pairs
 
