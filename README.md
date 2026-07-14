@@ -130,6 +130,25 @@ parameters for this compound: CCCCCC"*, writing results under `./qm_output/`.
 Edit the SMILES / residue name there, or drive the orchestrator from your own
 script via `orchestrator.run(prompt, deps=QMDeps(...))`.
 
+### Live demo — CPU only, no GPU, no AmberTools, no API key
+
+`qmagent.demo` runs the **quantum core** (build → geometry optimization → ESP →
+RESP2 charges) on plain CPU PySCF and prints the fitted partial charges. It
+drives the `QMAgent` actions directly through a local in-process exchange, so it
+needs neither an LLM/API key nor a GPU nor AmberTools — only `pyscf` + `geometric`:
+
+```bash
+pip install pyscf geometric          # no gpu4pyscf / CUDA required
+uv run python -m qmagent.demo                      # methanol (default)
+uv run python -m qmagent.demo --smiles CC(=O)NC    # N-methylacetamide
+```
+
+Under the hood this is `QMAgent(use_gpu=False)`, which swaps the `gpu4pyscf`
+import for CPU `pyscf`; the ESP grid, two-stage RESP fit and symmetry handling
+are identical to the GPU path. Keep molecules small and the basis modest for a
+snappy live run. The LLM-driven reference ladder can also run CPU-only with the
+`--cpu` flag (below).
+
 ### The reference ladder
 
 `test_systems.py` runs a ladder of small model compounds with **known published

@@ -47,8 +47,12 @@ def geomopt_app(geom_str: str,
                 max_steps: int,
                 constraints: Path | None,
                 num_threads: int,
-                max_memory: int) -> OptimizationResult:
-    from gpu4pyscf import dft
+                max_memory: int,
+                gpu: bool=True) -> OptimizationResult:
+    if gpu:
+        from gpu4pyscf import dft
+    else:
+        from pyscf import dft
     from pyscf import lib
     from pyscf.geomopt.geometric_solver import optimize
     from .distributed import load_dft
@@ -62,7 +66,7 @@ def geomopt_app(geom_str: str,
         verbose=verbose,
         max_memory=max_memory,
         symmetry=False,
-        gpu=True
+        gpu=gpu
     )
 
     mol_eq = optimize(
@@ -89,7 +93,8 @@ def esp_app(geom_str: str,
             verbose: int,
             grid_pts: np.ndarray,
             num_threads: int,
-            max_memory: int) -> ESPCalculation:
+            max_memory: int,
+            gpu: bool=True) -> ESPCalculation:
     """Computes ESP as grid points.
     ESP = Nuclear contribution + Electronic contribution
     V(r) = sum_A Z_A / |r - R_A| - integral rho(r') / |r - r'| dr'
@@ -112,7 +117,7 @@ def esp_app(geom_str: str,
         verbose=verbose,
         max_memory=max_memory,
         symmetry=False,
-        gpu=True
+        gpu=gpu
     )
 
     mol = mf.mol
@@ -168,8 +173,12 @@ def scan_torsions_app(xyz: XYZContents,
                       torsion: tuple[int, int, int, int],
                       verbose: int,
                       num_threads: int,
-                      max_memory: int=12000,) -> TorsionScanResult:
-    from gpu4pyscf import dft
+                      max_memory: int=12000,
+                      gpu: bool=True) -> TorsionScanResult:
+    if gpu:
+        from gpu4pyscf import dft
+    else:
+        from pyscf import dft
     import numpy as np
     from pyscf import lib
     from pyscf.geomopt.geometric_solver import optimize
@@ -200,7 +209,7 @@ def scan_torsions_app(xyz: XYZContents,
             verbose=verbose,
             max_memory=max_memory,
             symmetry=False,
-            gpu=True
+            gpu=gpu
         )
 
         # geomeTRIC constraints dictionary

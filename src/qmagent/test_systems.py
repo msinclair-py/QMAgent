@@ -120,6 +120,11 @@ async def main() -> None:
         '--output', type=Path, default=Path('./qm_output'),
         help='Base output directory (default ./qm_output); each system gets a subdir.',
     )
+    parser.add_argument(
+        '--cpu', action='store_true',
+        help='Run the QM steps on CPU PySCF (use_gpu=False) instead of gpu4pyscf, '
+             'for a GPU-less machine. Slower; keep to the smallest systems.',
+    )
     args = parser.parse_args()
 
     systems = TEST_SYSTEMS
@@ -140,7 +145,9 @@ async def main() -> None:
         factory=LocalExchangeFactory(),
         executors=ThreadPoolExecutor(),
     ) as manager:
-        qm_handle = await manager.launch(QMAgent(num_threads=os.cpu_count() or 8))
+        qm_handle = await manager.launch(
+            QMAgent(num_threads=os.cpu_count() or 8, use_gpu=not args.cpu)
+        )
 
         results = []
         for system in systems:

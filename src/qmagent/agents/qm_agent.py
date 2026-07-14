@@ -66,12 +66,17 @@ class QMAgent(Agent):
     def __init__(self,
                  num_threads: int,
                  max_memory: int=160000,
-                 parsl_config: Config | None=None,):
+                 parsl_config: Config | None=None,
+                 use_gpu: bool=True,):
         super().__init__()
         self.num_threads = num_threads
         self.max_memory = max_memory
         # Loaded in agent_on_startup; defaults to a local CPU config.
         self._parsl_config = parsl_config
+        # When False the DFT apps import ``pyscf`` (CPU) instead of ``gpu4pyscf``,
+        # so the whole QM pipeline runs on a machine with no GPU/CUDA (the live
+        # demo path). HPC/GPU deployments keep the default True.
+        self.use_gpu = use_gpu
 
     async def agent_on_startup(self) -> None:
         """Load a parsl DataFlowKernel so the workflow apps can execute.
@@ -171,7 +176,8 @@ class QMAgent(Agent):
                     max_steps=max_steps,
                     constraints = constraints,
                     num_threads = self.num_threads,
-                    max_memory = self.max_memory
+                    max_memory = self.max_memory,
+                    gpu = self.use_gpu
                 )
             )
 
@@ -218,7 +224,8 @@ class QMAgent(Agent):
                         verbose=4,
                         grid_pts=grid_points,
                         num_threads=self.num_threads,
-                        max_memory=self.max_memory
+                        max_memory=self.max_memory,
+                        gpu=self.use_gpu
                     )
                 )
             )
@@ -254,6 +261,7 @@ class QMAgent(Agent):
                         verbose=4,
                         num_threads=self.num_threads,
                         max_memory=self.max_memory,
+                        gpu=self.use_gpu,
                     )
                 )
             )
