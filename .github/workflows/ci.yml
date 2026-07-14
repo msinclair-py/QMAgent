@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: tests (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Sync environment (locked)
+        # --frozen uses uv.lock exactly and fails if it is out of date with
+        # pyproject.toml, so the lockfile stays honest. The heavy QM/MM runtime
+        # (pyscf, gpu4pyscf, AmberTools) is intentionally NOT a declared
+        # dependency; the test suite is dependency-light and needs none of it.
+        run: uv sync --extra dev --frozen
+
+      - name: Run tests
+        run: uv run pytest -ra

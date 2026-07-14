@@ -1,5 +1,7 @@
 # QMAgent
 
+[![CI](https://github.com/msinclair-py/QMAgent/actions/workflows/ci.yml/badge.svg)](https://github.com/msinclair-py/QMAgent/actions/workflows/ci.yml)
+
 Agentic harness for constructing quantum-chemistry (QM) workflows, distributing
 them across HPC resources, and automatically exploring protocols. Its primary
 target is **parameterizing novel biomolecules — post-translational modifications,
