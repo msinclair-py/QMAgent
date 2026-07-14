@@ -325,7 +325,7 @@ def fit_torsions_app(scan: TorsionScanResult,
         (TorsionFitResult): Fitted frcmod path and GAFF2 atom-type quartet.
     """
     import parmed
-    from .amber_apps import run_paramfit
+    from .amber_apps import run_paramfit, parse_paramfit_k
     from ..utils.file_ops import XYZContents
     from ..utils.pydantic_models import TorsionFitResult
 
@@ -352,7 +352,7 @@ def fit_torsions_app(scan: TorsionScanResult,
     a, b, c, d = (parm.atoms[idx].type for idx in scan.torsion)
 
     def write_job_ctrl(path: Path, *, param_file: Path | None=None,
-                       frcmod_out: Path | None=None) -> None:
+                       frcmod_out: Path | None=None, k_value: float | None=None) -> None:
         lines = [
             'RUNTYPE=FIT',
             f'NSTRUCTURES={len(scan.points)}',
@@ -369,15 +369,30 @@ def fit_torsions_app(scan: TorsionScanResult,
                       f'PARAMETER_FILE_NAME={param_file}']
         else:
             lines.append('PARAMETERS_TO_FIT=K_ONLY')
+        # Seed the fitted QM/MM energy offset K from the K_ONLY pre-pass. Without
+        # it the LOAD fit uses K=0 as its baseline, shifting the whole MM energy
+        # surface and biasing the fitted V_n. This is the documented paramfit
+        # dihedral workflow (K_ONLY -> record K -> main fit with K set).
+        if k_value is not None:
+            lines.append(f'K={k_value}')
         if frcmod_out is not None:
             lines.append(f'WRITE_FRCMOD={frcmod_out}')
         path.write_text('\n'.join(lines) + '\n')
 
     # Pass 1: K_ONLY - fit the QM/MM energy offset
     fit_k = work / 'fit_K.in'
+    fit_k_log = work / 'fit_K.log'
     write_job_ctrl(fit_k)
-    if not run_paramfit(fit_k, prmtop, mdcrd, qm_energies, work / 'fit_K.log', amberhome):
+    if not run_paramfit(fit_k, prmtop, mdcrd, qm_energies, fit_k_log, amberhome):
         return TorsionFitResult(torsion=scan.torsion, atom_types=(a, b, c, d))
+
+    # Recover K from the pre-pass log so pass 2 can hold it fixed. If parsing
+    # fails (paramfit's exact wording varies by version) we fall back to the old
+    # behaviour -- pass 2 without an explicit K -- rather than guessing.
+    k_value = parse_paramfit_k(fit_k_log)
+    if k_value is None:
+        print('Warning: could not parse K from the paramfit K_ONLY log; '
+              'proceeding without an explicit energy offset.')
 
     # Pass 2: LOAD - fit V_n / phase for each periodicity
     param_file = work / 'params.in'
@@ -390,7 +405,7 @@ def fit_torsions_app(scan: TorsionScanResult,
 
     frcmod_out = work / 'fit.frcmod'
     fit_in = work / 'fit.in'
-    write_job_ctrl(fit_in, param_file=param_file, frcmod_out=frcmod_out)
+    write_job_ctrl(fit_in, param_file=param_file, frcmod_out=frcmod_out, k_value=k_value)
     success = run_paramfit(fit_in, prmtop, mdcrd, qm_energies, work / 'fit.log', amberhome)
 
     return TorsionFitResult(
