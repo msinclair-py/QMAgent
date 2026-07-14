@@ -132,6 +132,13 @@ def esp_app(geom_str: str,
     energy = mf.kernel()
 
     dm = mf.make_rdm1()
+    # gpu4pyscf returns a CuPy density matrix, but the ESP integrals below run on
+    # CPU PySCF (df.incore.aux_e2 / np.einsum are NumPy-only), so contracting a
+    # CuPy dm with NumPy integrals raises. Move the density to host first. This is
+    # a no-op on the CPU path, where make_rdm1() already returns a NumPy array.
+    if gpu:
+        import cupy
+        dm = cupy.asnumpy(dm)
     bohr_per_angstrom = 1.8897259886
     grid_pts_bohr = grid_pts * bohr_per_angstrom
     coords_bohr = mol.atom_coords()  # pyscf returns coordinates in bohr
