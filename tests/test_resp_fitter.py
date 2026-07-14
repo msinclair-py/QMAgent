@@ -100,6 +100,37 @@ def test_hyperbolic_restraint_shrinks_charge_magnitudes(synthetic_esp):
     assert np.linalg.norm(q_restrained) <= np.linalg.norm(q_free) + 1e-9
 
 
+def test_unrestrained_atom_is_exempt_from_restraint(synthetic_esp):
+    coords, grid_pts, esp, q_true = synthetic_esp
+    fitter = RESPFitter(coords, grid_pts, esp)
+
+    # Under a strong restraint, atom 0 is pulled toward zero when restrained but
+    # should stay near its true (unrestrained least-squares) value when exempted.
+    q_restrained = fitter.fit(total_charge=0, restraint_a=0.05)
+    q_exempt = fitter.fit(total_charge=0, restraint_a=0.05, unrestrained_atoms={0})
+
+    # Exempting atom 0 keeps its magnitude larger (closer to the true charge)
+    # than restraining it does.
+    assert abs(q_exempt[0]) > abs(q_restrained[0])
+    assert abs(q_exempt[0] - q_true[0]) < abs(q_restrained[0] - q_true[0])
+
+
+def test_two_stage_resp_leaves_hydrogens_unrestrained(synthetic_esp):
+    # With H atoms in the system, the two-stage fit must exempt them from the
+    # restraint (ihfree). Compare a hydrogen's charge to what it would be if the
+    # same atom were a (restrained) heavy atom: the H must not be shrunk more.
+    coords, grid_pts, esp, _ = synthetic_esp
+    fitter = RESPFitter(coords, grid_pts, esp)
+
+    q_with_h = fitter.two_stage_resp(elements=["C", "H", "H"], total_charge=0)
+    q_all_heavy = fitter.two_stage_resp(elements=["C", "O", "O"], total_charge=0)
+
+    # Atoms 1 and 2 are hydrogens in the first call (unrestrained) and heavy in
+    # the second (restrained in stage 1), so their magnitudes should be >= the
+    # heavy-atom case.
+    assert abs(q_with_h[1]) + abs(q_with_h[2]) >= abs(q_all_heavy[1]) + abs(q_all_heavy[2]) - 1e-9
+
+
 def test_two_stage_resp_conserves_total_charge(synthetic_esp):
     coords, grid_pts, esp, _ = synthetic_esp
     fitter = RESPFitter(coords, grid_pts, esp)

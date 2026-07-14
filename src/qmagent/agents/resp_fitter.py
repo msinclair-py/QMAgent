@@ -65,6 +65,7 @@ class RESPFitter:
         symmetry_constraints: list[tuple[int, int]] | None=None,
         frozen_atoms: list[int]=None,
         frozen_charges: dict[int, float]=None,
+        unrestrained_atoms: set[int] | None=None,
     ):
         """
         Fit RESP charges.
@@ -84,6 +85,10 @@ class RESPFitter:
                 Atom indices with fixed charges
             frozen_charges : dict {atom_idx: charge}
                 Fixed charge values for frozen atoms
+            unrestrained_atoms : set of int
+                Atom indices exempt from the hyperbolic restraint (in addition to
+                frozen atoms). Standard RESP (ihfree=1) leaves hydrogens
+                unrestrained; ``two_stage_resp`` passes the hydrogens here.
 
         Returns:
             (np.ndarray): Charge array
@@ -96,6 +101,10 @@ class RESPFitter:
             frozen_atoms = []
         if frozen_charges is None:
             frozen_charges = {}
+
+        # Atoms that carry no hyperbolic restraint: frozen atoms (their charge is
+        # fixed) plus the caller-supplied exemptions (hydrogens, per ihfree=1).
+        restraint_skip = set(frozen_atoms) | (set(unrestrained_atoms) if unrestrained_atoms else set())
 
         # Initial guess: distribute charge evenly
         q0 = np.full(self.natom, total_charge / self.natom)
@@ -161,7 +170,7 @@ class RESPFitter:
             # Hyperbolic restraint (not on frozen atoms)
             restraint = 0.0
             for i in range(self.natom):
-                if i not in frozen_atoms:
+                if i not in restraint_skip:
                     restraint += np.sqrt(q[i]**2 + restraint_b**2) - restraint_b
 
             return chi2 + restraint_a * restraint
@@ -175,7 +184,7 @@ class RESPFitter:
 
             # Restraint gradient
             for i in range(self.natom):
-                if i not in frozen_atoms:
+                if i not in restraint_skip:
                     grad[i] += restraint_a * q[i] / np.sqrt(q[i]**2 + restraint_b**2)
 
             return grad
@@ -224,6 +233,15 @@ class RESPFitter:
                 at its stage-1 charge. If None or empty, every atom is frozen
                 and stage 2 trivially returns the stage-1 charges.
         """
+        # Hydrogens are exempt from the hyperbolic restraint (standard RESP
+        # ihfree=1): the restraint targets the poorly-determined heavy-atom
+        # charges, while hydrogen charges are left to the ESP fit and symmetry
+        # equivalencing. This is the one place ``elements`` is used.
+        hydrogens = {
+            i for i, el in enumerate(elements)
+            if str(el).strip().upper() == 'H'
+        }
+
         # Stage 1
         print('  Stage 1: weak restraint (a=0.0005), all atoms free')
         q1 = self.fit(
@@ -231,6 +249,7 @@ class RESPFitter:
             restraint_a=0.0005,
             charge_constraints=charge_constraints,
             symmetry_constraints=symmetry_constraints,
+            unrestrained_atoms=hydrogens,
         )
 
         print(f'  Stage 1 charges: sum = {q1.sum():.6f}')
@@ -263,6 +282,7 @@ class RESPFitter:
             symmetry_constraints=active_symmetry,
             frozen_atoms=frozen_atoms,
             frozen_charges=frozen_charges,
+            unrestrained_atoms=hydrogens,
         )
 
         print(f'  Stage 2 charges: sum = {q2.sum():.6f}')
