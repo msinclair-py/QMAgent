@@ -176,10 +176,8 @@ class RESPFitter:
             return chi2 + restraint_a * restraint
 
         def gradient(q):
-            esp_calc = self.inv_r @ q
-            residual = self.esp - esp_calc
-            grad = -2.0 * (self.A @ q - self.B)  # d(chi2)/dq = -2*(B - A*q)
-            # Actually: grad = 2 * (A @ q - B)
+            # d(chi2)/dq for chi2 = ||esp - inv_r q||^2 is 2*(A q - B), with
+            # A = inv_r^T inv_r and B = inv_r^T esp (both precomputed).
             grad = 2.0 * (self.A @ q - self.B)
 
             # Restraint gradient
