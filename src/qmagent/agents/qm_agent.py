@@ -781,7 +781,7 @@ class QMAgent(Agent):
 
     @staticmethod
     def generate_mk_grid(elements: list[str],
-                         coords: list[str],
+                         coords: np.ndarray,
                          density: float=1.) -> np.ndarray:
         """Generate Merz-Kollman ESP grid points.
 

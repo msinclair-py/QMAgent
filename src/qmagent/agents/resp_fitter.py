@@ -63,8 +63,8 @@ class RESPFitter:
         restraint_b: float=0.1,
         charge_constraints: list[tuple[int, float]] | None=None,
         symmetry_constraints: list[tuple[int, int]] | None=None,
-        frozen_atoms: list[int]=None,
-        frozen_charges: dict[int, float]=None,
+        frozen_atoms: list[int] | None=None,
+        frozen_charges: dict[int, float] | None=None,
         unrestrained_atoms: set[int] | None=None,
     ):
         """
