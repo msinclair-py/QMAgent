@@ -245,6 +245,29 @@ class QMAgent(Agent):
                             output_dir: Path,
                             torsions: Torsions,
                             scan_step: int=15) -> tuple[TorsionScanSet, Torsions]:
+        """Run a relaxed QM dihedral scan over each requested torsion.
+
+        Every torsion is scanned independently and in parallel (one parsl app
+        per torsion). Each scan walks the dihedral from 0 to 360 degrees in
+        ``scan_step`` increments, running a constrained geometry optimization at
+        each angle and recording the relaxed energy. A scan that fails to
+        complete every angle (a constrained optimization broke down mid-scan) is
+        reported back in the failed set rather than silently truncated.
+
+        Arguments:
+            contents (XYZContents): The optimized geometry to scan from (element
+                order and coordinates).
+            qm_config (QMConfig): QM settings for each constrained optimization.
+            output_dir (Path): Directory for per-torsion scan output (one
+                subdirectory per torsion) and the saved ``torsion_scan.json``.
+            torsions (Torsions): Set of 0-indexed dihedral atom quartets to scan.
+            scan_step (int): Defaults to 15. Angular step in degrees; must divide
+                360 evenly to give whole-number angle targets.
+
+        Returns:
+            (tuple[TorsionScanSet, Torsions]): The completed scans, and the set
+                of torsions that did not reach the full angle count.
+        """
         num_angles = 360 // scan_step
         target_angles = [i * scan_step for i in range(num_angles)]
 
@@ -351,9 +374,20 @@ class QMAgent(Agent):
         q_solv = await futures['solv']
 
         q_resp2 = delta_resp2 * q_solv + (1 - delta_resp2) * q_gas
-        assert np.isclose(q_resp2.sum(), qm_config.charge)
 
-        metadata = {'method': 'RESP2', 'delta': delta_resp2, 'total_charge': float(q_resp2.sum())}
+        # Both phase fits enforce the total-charge constraint, and the RESP2
+        # interpolation preserves it (delta*c + (1-delta)*c = c), so a mismatch
+        # here means a phase fit failed to converge. Raise rather than assert so
+        # the check survives `python -O` and gives an actionable message.
+        total = float(q_resp2.sum())
+        if not np.isclose(total, qm_config.charge, atol=1e-3):
+            raise ValueError(
+                f'RESP2 charges sum to {total:+.6f} e but the target net charge is '
+                f'{qm_config.charge:+d}. A phase RESP fit likely failed to converge; '
+                're-run the ESP/RESP steps or inspect the fitter warnings.'
+            )
+
+        metadata = {'method': 'RESP2', 'delta': delta_resp2, 'total_charge': total}
         resp_charges = RESPCharges(elements=molecule.elements, charges=q_resp2, metadata=metadata)
 
         return resp_charges

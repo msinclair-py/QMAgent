@@ -66,7 +66,8 @@ def geomopt_app(geom_str: str,
         verbose=verbose,
         max_memory=max_memory,
         symmetry=False,
-        gpu=gpu
+        gpu=gpu,
+        log_file=log_file,
     )
 
     mol_eq = optimize(
@@ -117,7 +118,8 @@ def esp_app(geom_str: str,
         verbose=verbose,
         max_memory=max_memory,
         symmetry=False,
-        gpu=gpu
+        gpu=gpu,
+        log_file=log_file,
     )
 
     mol = mf.mol
@@ -392,10 +394,15 @@ def load_dft(
     verbose: int,
     max_memory: int,
     symmetry: bool=True,
-    gpu: bool=True
+    gpu: bool=True,
+    log_file: str | Path | None=None,
 ):
     from pyscf import gto
 
+    # The Mole is always built with CPU PySCF (gpu4pyscf reuses it). Passing
+    # ``output`` redirects PySCF's own logging (SCF cycles, convergence) to that
+    # file instead of stdout, so the per-calculation log_file the callers thread
+    # in is actually written. None keeps the default (stdout).
     mol = gto.M(
         atom=geom_str,
         basis=qm_config.basis,
@@ -404,6 +411,7 @@ def load_dft(
         verbose=verbose,
         max_memory=max_memory,
         symmetry=symmetry,
+        output=str(log_file) if log_file is not None else None,
     )
 
     if gpu:
