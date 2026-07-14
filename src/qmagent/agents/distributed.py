@@ -445,7 +445,9 @@ def _converge_scf(mf, label: str):
             print(f'Warning: {label} Newton retry unavailable/failed: {exc}')
         if not getattr(mf, 'converged', False):
             raise RuntimeError(f'{label} SCF failed to converge.')
-    return mf, energy
+    # gpu4pyscf may hand back a 0-d CuPy scalar; float() forces a host Python
+    # float so it validates cleanly into the pydantic `float` result fields.
+    return mf, float(energy)
 
 
 def load_dft(
