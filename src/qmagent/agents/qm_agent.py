@@ -824,7 +824,12 @@ class QMAgent(Agent):
                     if j == i:
                         continue
 
-                    r_excl = vdw_radii[elem] * shell_factors[0]
+                    # Exclude points that fall inside neighbour j's innermost
+                    # Connolly shell. The radius must be j's own vdW radius
+                    # (elem_j), not the current shell atom's (elem) -- otherwise a
+                    # point near a large atom is judged against a small atom's
+                    # radius and wrongly kept inside the large atom's vdW volume.
+                    r_excl = vdw_radii[elem_j] * shell_factors[0]
                     dists = np.linalg.norm(shell_pts - center_j, axis=1)
                     keep &= dists > r_excl
 

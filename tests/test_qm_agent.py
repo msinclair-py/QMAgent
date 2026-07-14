@@ -63,6 +63,27 @@ def test_mk_grid_mismatched_inputs_raise():
         QMAgent.generate_mk_grid(["C", "O"], np.array([[0.0, 0.0, 0.0]]))
 
 
+def test_mk_grid_excludes_points_inside_each_neighbours_own_shell():
+    # Defining MK property: no grid point may lie inside ANY atom's innermost
+    # (1.4x vdW) Connolly shell, using that atom's OWN radius. A small H next to
+    # a large S is the discriminating case -- the old code excluded around S using
+    # H's (small) radius, leaving points buried inside sulfur's vdW volume.
+    vdw = {"H": 1.20, "S": 1.80}
+    elements = ["H", "S"]
+    coords = np.array([[0.0, 0.0, 0.0], [1.8, 0.0, 0.0]])  # close enough to overlap
+
+    grid = QMAgent.generate_mk_grid(elements, coords)
+
+    for j, (elem_j, center_j) in enumerate(zip(elements, coords)):
+        dists = np.linalg.norm(grid - center_j, axis=1)
+        inner = vdw[elem_j] * 1.4
+        # Allow a hair of numerical slack; points sit ON a shell at worst.
+        assert dists.min() >= inner - 1e-6, (
+            f"a grid point lies inside atom {j} ({elem_j}) inner shell "
+            f"({dists.min():.4f} < {inner:.4f})"
+        )
+
+
 # --------------------------------------------------------------------------- #
 # find_symmetry_pairs
 # --------------------------------------------------------------------------- #
