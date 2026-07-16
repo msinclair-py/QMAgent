@@ -5,7 +5,13 @@ from pathlib import Path
 from pydantic import BaseModel
 from pydantic_ai import Agent as PydanticAgent
 from pydantic_ai import ModelSettings, ModelRetry, RunContext
-from pydantic_ai.capabilities import Thinking, ToolSearch, WebSearch
+from pydantic_ai.capabilities import (
+    HandleDeferredToolCalls,
+    Thinking,
+    ToolSearch,
+    WebSearch,
+)
+from pydantic_ai.tools import DeferredToolRequests, DeferredToolResults, ToolDenied
 from pydantic_ai_backends import ConsoleCapability, LocalBackend, ensure_async
 from pydantic_ai_backends.permissions import READONLY_RULESET
 from pydantic_ai_shields import CostTracking, InputGuard, SecretRedaction, ToolGuard
@@ -109,6 +115,55 @@ research_subagent_prompt = (
     'in the scientific literature.'
 )
 
+def _resolve_deferred(ctx: RunContext[QMDeps],
+                      requests: DeferredToolRequests) -> DeferredToolResults:
+    """Deny approval-required tool calls instead of letting them kill the run.
+
+    ``ConsoleCapability`` registers its mutating tools (``run_in_background``,
+    ``execute``, ``write_file``, ...) with ``requires_approval=True``. Without a
+    handler, the first time the model calls one, pydantic-ai has nowhere to send
+    the approval request: it raises ``UserError`` ("a deferred tool call was
+    present, but DeferredToolRequests is not among output types") and the entire
+    run dies, discarding all work and spend.
+
+    This agent runs unattended, so there is no human to approve anything, and
+    the READONLY_RULESET it is configured with would refuse these operations at
+    call time regardless. Denying with an explanatory message keeps the run
+    alive and tells the model to route around the tool -- which it can, since
+    ``run_code`` covers the legitimate uses.
+
+    Arguments:
+        ctx (RunContext[QMDeps]): The active run context.
+        requests (DeferredToolRequests): Calls awaiting approval or external
+            execution.
+
+    Returns:
+        (DeferredToolResults): A denial for every pending call.
+    """
+    results = DeferredToolResults()
+
+    for call in requests.approvals:
+        results.approvals[call.tool_call_id] = ToolDenied(
+            message=(
+                f'{call.tool_name!r} needs approval, but this agent runs '
+                f'unattended with no one to grant it, and its filesystem '
+                f'permissions are read-only. Use run_code for anything that '
+                f'must execute code or write files -- it runs in a sandboxed '
+                f'subprocess in the run output directory.'
+            )
+        )
+
+    # Externally-executed tools: nothing here can execute them, so return the
+    # reason as the tool's result rather than stalling the run.
+    for call in requests.calls:
+        results.calls[call.tool_call_id] = (
+            f'{call.tool_name!r} requires external execution, which this '
+            f'deployment does not provide. Use run_code instead.'
+        )
+
+    return results
+
+
 orchestrator = PydanticAgent[QMDeps, ParameterizationSummary](
     model,
     deps_type=QMDeps,
@@ -135,6 +190,10 @@ orchestrator = PydanticAgent[QMDeps, ParameterizationSummary](
         ToolGuard(blocked=['rm']),
         SecretRedaction(),
         StuckLoopDetection(),
+        # Must be present whenever a toolset registers approval-required tools
+        # (ConsoleCapability does). Without it the first such call raises
+        # UserError and kills the run outright -- see _resolve_deferred.
+        HandleDeferredToolCalls(_resolve_deferred),
     ]
 )
 
