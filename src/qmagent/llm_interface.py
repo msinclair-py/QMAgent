@@ -164,43 +164,101 @@ def _resolve_deferred(ctx: RunContext[QMDeps],
     return results
 
 
-orchestrator = PydanticAgent[QMDeps, ParameterizationSummary](
-    model,
-    deps_type=QMDeps,
-    output_type=ParameterizationSummary,
-    # No temperature: `model` is a reasoning model, and providers reject or drop
-    # sampling parameters when reasoning is enabled ("Sampling parameters
-    # ['temperature'] are not supported when reasoning is enabled. These settings
-    # will be ignored."). Setting it read as a deliberate diversity knob while
-    # doing nothing. Re-add it only alongside a non-reasoning model.
-    model_settings=ModelSettings(max_tokens=10000),
-    instructions=system_prompt,  # instructions (not system_prompt) so only the current agent's prompt reaches the model
-    capabilities=[
-        ToolSearch(),
-        Thinking('xhigh'),
-        ContextManagerCapability(max_tokens=context_max_tokens),
-        WebSearch(),
-        ConsoleCapability(permissions=READONLY_RULESET),  # grep, glob, ls, read
-        MemoryCapability(agent_name='quantum-agent'),
-        SkillsCapability(directories=['./skills']),
-        SubAgentCapability(subagents=[
-            SubAgentConfig(
-                name='researcher',
-                description='Deep research on a topic',
-                instructions=research_subagent_prompt
-            ),
-        ]),
-        TodoCapability(enable_subtasks=True, async_storage=AsyncMemoryStorage()),
-        InputGuard(guard=lambda p: 'ignore previous instructions' not in p.lower()),
-        ToolGuard(blocked=['rm']),
-        SecretRedaction(),
-        StuckLoopDetection(),
-        # Must be present whenever a toolset registers approval-required tools
-        # (ConsoleCapability does). Without it the first such call raises
-        # UserError and kills the run outright -- see _resolve_deferred.
-        HandleDeferredToolCalls(_resolve_deferred),
-    ]
-)
+def _build_orchestrator() -> PydanticAgent[QMDeps, ParameterizationSummary]:
+    """Construct the coordinator agent and register its tools.
+
+    Called lazily by the module's ``__getattr__`` the first time ``orchestrator``
+    is accessed, and cached thereafter. Constructing an Agent resolves its model
+    string through ``infer_model``, which builds the provider and therefore
+    demands a credential *exist*; ``SubAgentCapability`` compiles its sub-agent
+    the same way. Doing that at module import made ``import
+    qmagent.llm_interface`` fail outright with a ``UserError`` on any machine
+    without ``OPENAI_API_KEY`` -- so the data models, the deps dataclass and the
+    tool functions could not be imported or tested offline, and even ``--help``
+    needed an API key.
+
+    Deferring it means a credential is required when you actually build the
+    agent (i.e. when you are about to run it), not when you import the module
+    that defines it.
+
+    Returns:
+        (PydanticAgent): The configured coordinator agent.
+    """
+    agent = PydanticAgent[QMDeps, ParameterizationSummary](
+        model,
+        deps_type=QMDeps,
+        output_type=ParameterizationSummary,
+        # No temperature: `model` is a reasoning model, and providers reject or
+        # drop sampling parameters when reasoning is enabled ("Sampling
+        # parameters ['temperature'] are not supported when reasoning is
+        # enabled. These settings will be ignored."). Setting it read as a
+        # deliberate diversity knob while doing nothing. Re-add it only
+        # alongside a non-reasoning model.
+        model_settings=ModelSettings(max_tokens=10000),
+        # instructions (not system_prompt) so only the current agent's prompt
+        # reaches the model
+        instructions=system_prompt,
+        capabilities=[
+            ToolSearch(),
+            Thinking('xhigh'),
+            ContextManagerCapability(max_tokens=context_max_tokens),
+            WebSearch(),
+            ConsoleCapability(permissions=READONLY_RULESET),  # grep, glob, ls, read
+            MemoryCapability(agent_name='quantum-agent'),
+            SkillsCapability(directories=['./skills']),
+            SubAgentCapability(subagents=[
+                SubAgentConfig(
+                    name='researcher',
+                    description='Deep research on a topic',
+                    instructions=research_subagent_prompt
+                ),
+            ]),
+            TodoCapability(enable_subtasks=True, async_storage=AsyncMemoryStorage()),
+            InputGuard(guard=lambda p: 'ignore previous instructions' not in p.lower()),
+            ToolGuard(blocked=['rm']),
+            SecretRedaction(),
+            StuckLoopDetection(),
+            # Must be present whenever a toolset registers approval-required tools
+            # (ConsoleCapability does). Without it the first such call raises
+            # UserError and kills the run outright -- see _resolve_deferred.
+            HandleDeferredToolCalls(_resolve_deferred),
+        ],
+    )
+
+    # Registered here rather than via @orchestrator.tool decorators: the agent
+    # no longer exists at module import time.
+    for tool in (
+        run_code,
+        build_compound,
+        geometry_optimization,
+        compute_esp,
+        scan_torsions,
+        fit_resp_charges,
+        integrate_amber_ff,
+        fit_torsions,
+        run_parameterization_pipeline,
+    ):
+        agent.tool(tool)
+
+    return agent
+
+
+_orchestrator: PydanticAgent[QMDeps, ParameterizationSummary] | None = None
+
+
+def __getattr__(name: str) -> Any:
+    """Build ``orchestrator`` on first access, then cache it (PEP 562).
+
+    Keeps ``from qmagent.llm_interface import QMDeps`` (and the tool functions,
+    and ParameterizationSummary) working with no provider credential, while
+    ``orchestrator`` itself still resolves normally for anyone about to run it.
+    """
+    if name == 'orchestrator':
+        global _orchestrator
+        if _orchestrator is None:
+            _orchestrator = _build_orchestrator()
+        return _orchestrator
+    raise AttributeError(f'module {__name__!r} has no attribute {name!r}')
 
 
 # --------------------------------------------------------------------------- #
@@ -209,7 +267,6 @@ orchestrator = PydanticAgent[QMDeps, ParameterizationSummary](
 # echoing large structured objects.
 # --------------------------------------------------------------------------- #
 
-@orchestrator.tool
 async def run_code(ctx: RunContext[QMDeps], code: str,
                    timeout: float = 1800.0) -> str:
     """Execute an arbitrary Python snippet on the QMAgent for bespoke analysis.
@@ -275,7 +332,6 @@ async def run_code(ctx: RunContext[QMDeps], code: str,
         out += f'\n--- STDERR (warnings) ---\n{stderr}'
     return out
 
-@orchestrator.tool
 async def build_compound(ctx: RunContext[QMDeps], smiles: str, max_iters: int = 2000) -> str:
     """Embed a SMILES string into a 3D conformer and write a model-compound mol2.
 
@@ -297,7 +353,6 @@ async def build_compound(ctx: RunContext[QMDeps], smiles: str, max_iters: int = 
     return f'Built {smiles} -> {mol2_file.name} (resname {deps.resname})'
 
 
-@orchestrator.tool
 async def geometry_optimization(ctx: RunContext[QMDeps],
                                 stages: list[QMConfig],
                                 constraints: str | None = None,
@@ -330,7 +385,6 @@ async def geometry_optimization(ctx: RunContext[QMDeps],
     return f'{gid}: optimized, final energy {result.energy:.6f} Ha, xyz={result.xyz_file.name}'
 
 
-@orchestrator.tool
 async def compute_esp(ctx: RunContext[QMDeps], geomopt_key: str, qm_config: QMConfig) -> str:
     """Compute the QM electrostatic potential (gas + solvent) on an MK grid.
 
@@ -355,7 +409,6 @@ async def compute_esp(ctx: RunContext[QMDeps], geomopt_key: str, qm_config: QMCo
     return f'{eid}: {len(result)} ESP calculations (gas + solvent) on the MK grid'
 
 
-@orchestrator.tool
 async def scan_torsions(ctx: RunContext[QMDeps],
                         geomopt_key: str,
                         qm_config: QMConfig,
@@ -393,7 +446,6 @@ async def scan_torsions(ctx: RunContext[QMDeps],
     return msg
 
 
-@orchestrator.tool
 async def fit_resp_charges(ctx: RunContext[QMDeps],
                            geomopt_key: str,
                            esp_key: str,
@@ -431,7 +483,6 @@ async def fit_resp_charges(ctx: RunContext[QMDeps],
     return f'{rid}: RESP2(delta={delta_resp2}) charges fit, total charge {total:+.4f} e'
 
 
-@orchestrator.tool
 async def integrate_amber_ff(ctx: RunContext[QMDeps],
                              resp_key: str,
                              charge: int | None = None) -> str:
@@ -487,7 +538,6 @@ async def integrate_amber_ff(ctx: RunContext[QMDeps],
             f'prmtop={result.prmtop.name}')
 
 
-@orchestrator.tool
 async def fit_torsions(ctx: RunContext[QMDeps],
                        torsionscan_key: str,
                        max_periodicity: int = 4) -> str:
@@ -519,7 +569,6 @@ async def fit_torsions(ctx: RunContext[QMDeps],
             f'refined frcmod={result.refined_frcmod.name}')
 
 
-@orchestrator.tool
 async def run_parameterization_pipeline(ctx: RunContext[QMDeps],
                                         smiles: str,
                                         optimization_stages: list[QMConfig],

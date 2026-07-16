@@ -8,9 +8,11 @@ network call.
 import os
 
 
-# The orchestrator is constructed at import time and infers its model, which
-# needs a provider credential to exist (not to be valid). Supply a dummy before
-# importing so the suite runs on a machine with no API key configured.
+# Importing the module needs no credential, but this file imports `orchestrator`
+# itself, which builds the agent and so infers the model -- that needs a key to
+# *exist*, not to be valid. Supply a dummy so the suite runs with none
+# configured. (test_module_imports_without_a_provider_credential asserts the
+# import-only path in a subprocess with the key genuinely absent.)
 os.environ.setdefault('OPENAI_API_KEY', 'test-key-not-used')
 
 from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart  # noqa: E402
@@ -116,3 +118,47 @@ def test_denial_message_points_the_model_at_run_code(tmp_path):
     denial = results.approvals['abc123']
     assert 'run_code' in denial.message
     assert 'run_in_background' in denial.message
+
+
+def test_module_imports_without_a_provider_credential():
+    """Importing llm_interface must not require an API key.
+
+    The orchestrator used to be constructed at module scope, so `import
+    qmagent.llm_interface` called infer_model -> OpenAIProvider() and raised
+    UserError on any machine without OPENAI_API_KEY. That made the data models,
+    QMDeps and the tool functions untestable offline, and meant even reading the
+    configured model name needed a credential. Run in a subprocess so the
+    module is imported fresh with the key genuinely absent.
+    """
+    import subprocess
+    import sys
+
+    env = {k: v for k, v in os.environ.items() if k != 'OPENAI_API_KEY'}
+    proc = subprocess.run(
+        [sys.executable, '-c',
+         'from qmagent.llm_interface import QMDeps, ParameterizationSummary, model; '
+         'print(model)'],
+        capture_output=True, text=True, env=env, timeout=120,
+    )
+    assert proc.returncode == 0, f'import needed a credential:\n{proc.stderr[-600:]}'
+    assert 'gpt' in proc.stdout
+
+
+def test_all_tools_are_registered_on_the_built_agent():
+    """Every tool must survive the move off @orchestrator.tool decorators."""
+    from qmagent.llm_interface import orchestrator
+
+    registered = set(orchestrator._function_toolset.tools)
+    expected = {
+        'run_code', 'build_compound', 'geometry_optimization', 'compute_esp',
+        'scan_torsions', 'fit_resp_charges', 'integrate_amber_ff',
+        'fit_torsions', 'run_parameterization_pipeline',
+    }
+    assert expected <= registered, f'missing: {sorted(expected - registered)}'
+
+
+def test_orchestrator_is_cached_not_rebuilt():
+    """__getattr__ must cache: rebuilding per access would be slow and lose overrides."""
+    import qmagent.llm_interface as li
+
+    assert li.orchestrator is li.orchestrator
