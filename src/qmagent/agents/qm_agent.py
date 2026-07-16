@@ -66,12 +66,17 @@ class QMAgent(Agent):
     def __init__(self,
                  num_threads: int,
                  max_memory: int=160000,
-                 parsl_config: Config | None=None,):
+                 parsl_config: Config | None=None,
+                 use_gpu: bool=True,):
         super().__init__()
         self.num_threads = num_threads
         self.max_memory = max_memory
         # Loaded in agent_on_startup; defaults to a local CPU config.
         self._parsl_config = parsl_config
+        # When False the DFT apps import ``pyscf`` (CPU) instead of ``gpu4pyscf``,
+        # so the whole QM pipeline runs on a machine with no GPU/CUDA (the live
+        # demo path). HPC/GPU deployments keep the default True.
+        self.use_gpu = use_gpu
 
     async def agent_on_startup(self) -> None:
         """Load a parsl DataFlowKernel so the workflow apps can execute.
@@ -171,7 +176,8 @@ class QMAgent(Agent):
                     max_steps=max_steps,
                     constraints = constraints,
                     num_threads = self.num_threads,
-                    max_memory = self.max_memory
+                    max_memory = self.max_memory,
+                    gpu = self.use_gpu
                 )
             )
 
@@ -218,7 +224,8 @@ class QMAgent(Agent):
                         verbose=4,
                         grid_pts=grid_points,
                         num_threads=self.num_threads,
-                        max_memory=self.max_memory
+                        max_memory=self.max_memory,
+                        gpu=self.use_gpu
                     )
                 )
             )
@@ -238,6 +245,29 @@ class QMAgent(Agent):
                             output_dir: Path,
                             torsions: Torsions,
                             scan_step: int=15) -> tuple[TorsionScanSet, Torsions]:
+        """Run a relaxed QM dihedral scan over each requested torsion.
+
+        Every torsion is scanned independently and in parallel (one parsl app
+        per torsion). Each scan walks the dihedral from 0 to 360 degrees in
+        ``scan_step`` increments, running a constrained geometry optimization at
+        each angle and recording the relaxed energy. A scan that fails to
+        complete every angle (a constrained optimization broke down mid-scan) is
+        reported back in the failed set rather than silently truncated.
+
+        Arguments:
+            contents (XYZContents): The optimized geometry to scan from (element
+                order and coordinates).
+            qm_config (QMConfig): QM settings for each constrained optimization.
+            output_dir (Path): Directory for per-torsion scan output (one
+                subdirectory per torsion) and the saved ``torsion_scan.json``.
+            torsions (Torsions): Set of 0-indexed dihedral atom quartets to scan.
+            scan_step (int): Defaults to 15. Angular step in degrees; must divide
+                360 evenly to give whole-number angle targets.
+
+        Returns:
+            (tuple[TorsionScanSet, Torsions]): The completed scans, and the set
+                of torsions that did not reach the full angle count.
+        """
         num_angles = 360 // scan_step
         target_angles = [i * scan_step for i in range(num_angles)]
 
@@ -254,6 +284,7 @@ class QMAgent(Agent):
                         verbose=4,
                         num_threads=self.num_threads,
                         max_memory=self.max_memory,
+                        gpu=self.use_gpu,
                     )
                 )
             )
@@ -343,9 +374,20 @@ class QMAgent(Agent):
         q_solv = await futures['solv']
 
         q_resp2 = delta_resp2 * q_solv + (1 - delta_resp2) * q_gas
-        assert np.isclose(q_resp2.sum(), qm_config.charge)
 
-        metadata = {'method': 'RESP2', 'delta': delta_resp2, 'total_charge': float(q_resp2.sum())}
+        # Both phase fits enforce the total-charge constraint, and the RESP2
+        # interpolation preserves it (delta*c + (1-delta)*c = c), so a mismatch
+        # here means a phase fit failed to converge. Raise rather than assert so
+        # the check survives `python -O` and gives an actionable message.
+        total = float(q_resp2.sum())
+        if not np.isclose(total, qm_config.charge, atol=1e-3):
+            raise ValueError(
+                f'RESP2 charges sum to {total:+.6f} e but the target net charge is '
+                f'{qm_config.charge:+d}. A phase RESP fit likely failed to converge; '
+                're-run the ESP/RESP steps or inspect the fitter warnings.'
+            )
+
+        metadata = {'method': 'RESP2', 'delta': delta_resp2, 'total_charge': total}
         resp_charges = RESPCharges(elements=molecule.elements, charges=q_resp2, metadata=metadata)
 
         return resp_charges
@@ -666,26 +708,36 @@ class QMAgent(Agent):
     def find_symmetry_pairs(mol2: Path) -> list[tuple[int, int]]:
         """Find symmetry-equivalent atom pairs in the model compound.
         (E.g. the 3 hydrogens on a methyl group which must each have the same charge)
-        
+
+        Topologically equivalent atoms share a canonical rank when ties are left
+        unbroken (``Chem.CanonicalRankAtoms(mol, breakTies=False)``); every atom in
+        such a class must carry the same RESP charge. For each class we chain
+        consecutive members -- (a, b), (b, c), ... -- so transitivity through the
+        equal-charge constraints equalizes the *whole* class. The previous
+        implementation took a single graph automorphism and would miss members not
+        moved by that one permutation (e.g. it could equate only two of a methyl's
+        three hydrogens).
+
         Arguments:
             mol2 (Path): Path to the input mol2 file for checking symmetry
+
+        Returns:
+            (list[tuple[int, int]]): 0-indexed (i, j) pairs with i < j whose
+                charges must be constrained equal.
         """
         mol = Chem.MolFromMol2File(str(mol2), removeHs=False, sanitize=True)
 
-        matches = mol.GetSubstructMatches(mol, uniquify=False)
+        ranks = Chem.CanonicalRankAtoms(mol, breakTies=False)
 
-        symmetry_pairs = []
-        identity = tuple(range(mol.GetNumAtoms()))
+        classes: dict[int, list[int]] = defaultdict(list)
+        for idx, rank in enumerate(ranks):
+            classes[rank].append(idx)
 
-        for match in matches:
-            if match == identity:
-                continue
-            for i in range(mol.GetNumAtoms()):
-                j = match[i]
-                if i < j:
-                    symmetry_pairs.append((i, j))
-
-            break
+        symmetry_pairs: list[tuple[int, int]] = []
+        for members in classes.values():
+            members.sort()
+            for a, b in zip(members, members[1:]):
+                symmetry_pairs.append((a, b))
 
         return symmetry_pairs
 
@@ -729,7 +781,7 @@ class QMAgent(Agent):
 
     @staticmethod
     def generate_mk_grid(elements: list[str],
-                         coords: list[str],
+                         coords: np.ndarray,
                          density: float=1.) -> np.ndarray:
         """Generate Merz-Kollman ESP grid points.
 
@@ -772,7 +824,12 @@ class QMAgent(Agent):
                     if j == i:
                         continue
 
-                    r_excl = vdw_radii[elem] * shell_factors[0]
+                    # Exclude points that fall inside neighbour j's innermost
+                    # Connolly shell. The radius must be j's own vdW radius
+                    # (elem_j), not the current shell atom's (elem) -- otherwise a
+                    # point near a large atom is judged against a small atom's
+                    # radius and wrongly kept inside the large atom's vdW volume.
+                    r_excl = vdw_radii[elem_j] * shell_factors[0]
                     dists = np.linalg.norm(shell_pts - center_j, axis=1)
                     keep &= dists > r_excl
 

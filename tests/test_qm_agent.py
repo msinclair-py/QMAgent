@@ -63,6 +63,27 @@ def test_mk_grid_mismatched_inputs_raise():
         QMAgent.generate_mk_grid(["C", "O"], np.array([[0.0, 0.0, 0.0]]))
 
 
+def test_mk_grid_excludes_points_inside_each_neighbours_own_shell():
+    # Defining MK property: no grid point may lie inside ANY atom's innermost
+    # (1.4x vdW) Connolly shell, using that atom's OWN radius. A small H next to
+    # a large S is the discriminating case -- the old code excluded around S using
+    # H's (small) radius, leaving points buried inside sulfur's vdW volume.
+    vdw = {"H": 1.20, "S": 1.80}
+    elements = ["H", "S"]
+    coords = np.array([[0.0, 0.0, 0.0], [1.8, 0.0, 0.0]])  # close enough to overlap
+
+    grid = QMAgent.generate_mk_grid(elements, coords)
+
+    for j, (elem_j, center_j) in enumerate(zip(elements, coords)):
+        dists = np.linalg.norm(grid - center_j, axis=1)
+        inner = vdw[elem_j] * 1.4
+        # Allow a hair of numerical slack; points sit ON a shell at worst.
+        assert dists.min() >= inner - 1e-6, (
+            f"a grid point lies inside atom {j} ({elem_j}) inner shell "
+            f"({dists.min():.4f} < {inner:.4f})"
+        )
+
+
 # --------------------------------------------------------------------------- #
 # find_symmetry_pairs
 # --------------------------------------------------------------------------- #
@@ -89,6 +110,35 @@ def test_find_symmetry_pairs_excludes_identity(ethane_mol2):
     # atom (i != j is guaranteed by the i < j filter, so just assert distinctness).
     pairs = QMAgent.find_symmetry_pairs(ethane_mol2)
     assert all(i != j for i, j in pairs)
+
+
+def test_find_symmetry_pairs_equalizes_whole_methyl(methanol_mol2):
+    from rdkit import Chem
+
+    # Regression guard for the canonical-rank fix: the three methyl hydrogens must
+    # be transitively connected by the emitted pairs (i.e. constrained to a single
+    # equal-charge class). A single graph automorphism could equate only two of
+    # the three; chaining consecutive members of the symmetry class must not.
+    mol = Chem.MolFromMol2File(str(methanol_mol2), removeHs=False, sanitize=True)
+    methyl_h = [
+        a.GetIdx() for a in mol.GetAtoms()
+        if a.GetSymbol() == "H"
+        and any(n.GetSymbol() == "C" for n in a.GetNeighbors())
+    ]
+    assert len(methyl_h) == 3
+
+    parent = {i: i for i in range(mol.GetNumAtoms())}
+
+    def find(x):
+        while parent[x] != x:
+            x = parent[x]
+        return x
+
+    for i, j in QMAgent.find_symmetry_pairs(methanol_mol2):
+        parent[find(i)] = find(j)
+
+    # All three methyl hydrogens collapse to one connected component.
+    assert len({find(h) for h in methyl_h}) == 1
 
 
 # --------------------------------------------------------------------------- #

@@ -1,6 +1,39 @@
 from parsl import python_app
 from pathlib import Path
+import re
 import subprocess
+
+def parse_paramfit_k(log_file: Path) -> float | None:
+    """Recover the fitted QM/MM energy offset K from a paramfit K_ONLY log.
+
+    paramfit reports the fitted K in the log of a ``PARAMETERS_TO_FIT=K_ONLY``
+    run; the main dihedral fit should then hold that K fixed (the documented
+    K_ONLY -> record K -> LOAD-fit workflow). The exact wording varies across
+    AmberTools versions, so several patterns are tried and ``None`` is returned
+    when none match, letting the caller fall back to not setting K rather than
+    guessing a wrong value.
+
+    Arguments:
+        log_file (Path): The paramfit K_ONLY log to parse.
+
+    Returns:
+        (float | None): The fitted K (kcal/mol), or None if it could not be found.
+    """
+    try:
+        text = log_file.read_text()
+    except OSError:
+        return None
+
+    patterns = (
+        r'value of K[^\-\d]*(-?\d+\.\d+)',   # "...value of K to be:  -12.34 KCal/mol"
+        r'\bK\b[^\-\d=]*(-?\d+\.\d+)\s*KCal', # "K =  -12.34 KCal/mol"
+        r'\bK\s*=\s*(-?\d+\.\d+)',            # "K= -12.34"
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return float(match.group(1))
+    return None
 
 def run_cmd(cmd, description='') -> bool:
     """Run a shell command and check for errors."""

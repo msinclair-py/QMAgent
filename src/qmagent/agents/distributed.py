@@ -47,11 +47,15 @@ def geomopt_app(geom_str: str,
                 max_steps: int,
                 constraints: Path | None,
                 num_threads: int,
-                max_memory: int) -> OptimizationResult:
-    from gpu4pyscf import dft
+                max_memory: int,
+                gpu: bool=True) -> OptimizationResult:
+    if gpu:
+        from gpu4pyscf import dft
+    else:
+        from pyscf import dft
     from pyscf import lib
     from pyscf.geomopt.geometric_solver import optimize
-    from .distributed import load_dft
+    from .distributed import load_dft, _converge_scf
     from ..utils.pydantic_models import OptimizationResult
 
     lib.num_threads(num_threads)
@@ -62,7 +66,8 @@ def geomopt_app(geom_str: str,
         verbose=verbose,
         max_memory=max_memory,
         symmetry=False,
-        gpu=True
+        gpu=gpu,
+        log_file=log_file,
     )
 
     mol_eq = optimize(
@@ -77,7 +82,7 @@ def geomopt_app(geom_str: str,
     mf_final.xc = qm_config.functional
     mf_final.disp = qm_config.dispersion
     mf_final.grids.atom_grid = qm_config.grid_level
-    e_final = mf_final.kernel()
+    mf_final, e_final = _converge_scf(mf_final, 'geometry-optimization final point')
 
     return OptimizationResult(e_final=e_final, coords=opt_coords)
 
@@ -89,25 +94,32 @@ def esp_app(geom_str: str,
             verbose: int,
             grid_pts: np.ndarray,
             num_threads: int,
-            max_memory: int) -> ESPCalculation:
+            max_memory: int,
+            gpu: bool=True) -> ESPCalculation:
     """Computes ESP as grid points.
     ESP = Nuclear contribution + Electronic contribution
     V(r) = sum_A Z_A / |r - R_A| - integral rho(r') / |r - r'| dr'
     """
     import numpy as np
     from pyscf import df, gto, lib
-    from .distributed import load_dft
+    from .distributed import load_dft, _converge_scf
     from ..utils.pydantic_models import ESPCalculation
 
     lib.num_threads(num_threads)
 
+    # symmetry=False is required here: with symmetry=True PySCF reorients the
+    # molecule into its standard symmetry frame, so mol.atom_coords() (used for
+    # the nuclear term) would no longer align with the MK grid, which is built
+    # externally from the input coordinates. That misalignment silently corrupts
+    # the ESP -- worst on the symmetric systems (e.g. phosphate, trimethyl).
     mf = load_dft(
         geom_str=geom_str,
         qm_config=qm_config,
         verbose=verbose,
         max_memory=max_memory,
-        symmetry=True,
-        gpu=True
+        symmetry=False,
+        gpu=gpu,
+        log_file=log_file,
     )
 
     mol = mf.mol
@@ -117,9 +129,17 @@ def esp_app(geom_str: str,
         mf.with_solvent.method = 'C-PCM'
         mf.with_solvent.eps = 78.3553
 
-    energy = mf.kernel()
+    phase = 'solvent' if solvated else 'gas'
+    mf, energy = _converge_scf(mf, f'ESP single point ({phase})')
 
     dm = mf.make_rdm1()
+    # gpu4pyscf returns a CuPy density matrix, but the ESP integrals below run on
+    # CPU PySCF (df.incore.aux_e2 / np.einsum are NumPy-only), so contracting a
+    # CuPy dm with NumPy integrals raises. Move the density to host first. This is
+    # a no-op on the CPU path, where make_rdm1() already returns a NumPy array.
+    if gpu:
+        import cupy
+        dm = cupy.asnumpy(dm)
     bohr_per_angstrom = 1.8897259886
     grid_pts_bohr = grid_pts * bohr_per_angstrom
     coords_bohr = mol.atom_coords()  # pyscf returns coordinates in bohr
@@ -163,12 +183,16 @@ def scan_torsions_app(xyz: XYZContents,
                       torsion: tuple[int, int, int, int],
                       verbose: int,
                       num_threads: int,
-                      max_memory: int=12000,) -> TorsionScanResult:
-    from gpu4pyscf import dft
+                      max_memory: int=12000,
+                      gpu: bool=True) -> TorsionScanResult:
+    if gpu:
+        from gpu4pyscf import dft
+    else:
+        from pyscf import dft
     import numpy as np
     from pyscf import lib
     from pyscf.geomopt.geometric_solver import optimize
-    from .distributed import load_dft
+    from .distributed import load_dft, _converge_scf
     from .qm_agent import QMAgent
     from ..utils.file_ops import XYZContents, write_xyz
     from ..utils.pydantic_models import ScanPoint, TorsionScanResult
@@ -186,13 +210,16 @@ def scan_torsions_app(xyz: XYZContents,
     for angle in target_angles:
         geom_str = QMAgent.formulate_geometry_string(xyz.elements, xyz.coords)
 
+        # symmetry=False: a constrained (frozen-dihedral) optimization can lower
+        # the molecular point group mid-scan, so symmetry detection at build time
+        # is unsafe here and can crash or silently corrupt the geometry.
         mf = load_dft(
             geom_str=geom_str,
             qm_config=qm_config,
             verbose=verbose,
             max_memory=max_memory,
-            symmetry=True,
-            gpu=True
+            symmetry=False,
+            gpu=gpu
         )
 
         # geomeTRIC constraints dictionary
@@ -206,13 +233,10 @@ def scan_torsions_app(xyz: XYZContents,
             ]
         }
 
-        try:
-            from pyscf import dftd3
-            mf = dftd3.dftd3(mf)
-        except ImportError:
-            print('Warning: dftd3 not found - dispersion correction missing!')
-            pass
-
+        # Dispersion is applied once, via mf.disp set in load_dft (consistent with
+        # geomopt_app/esp_app). Do NOT also wrap with dftd3.dftd3(mf): that would
+        # double-count the correction and corrupt the very torsion energy surface
+        # paramfit is fit against.
         try:
             mol_opt = optimize(
                 mf,
@@ -223,16 +247,13 @@ def scan_torsions_app(xyz: XYZContents,
             mf2 = dft.RKS(mol_opt)
 
             mf2.xc = qm_config.functional
-            mf2.disp = qm_config.dispersion
+            mf2.disp = qm_config.dispersion  # single dispersion source; see note above
             mf2.grids.atom_grid = qm_config.grid_level
 
-            try:
-                from pyscf import dftd3
-                mf2 = dftd3.dftd3(mf2)
-            except ImportError:
-                pass
-
-            energy = mf2.kernel()
+            # A non-converged point yields a garbage energy that would distort the
+            # torsion surface; _converge_scf raises on failure, which the except
+            # below turns into a (correctly flagged) incomplete scan.
+            mf2, energy = _converge_scf(mf2, f'torsion scan {angle:.1f} deg')
 
             coords = mol_opt.atom_coords(unit='Angstrom')
             
@@ -304,7 +325,7 @@ def fit_torsions_app(scan: TorsionScanResult,
         (TorsionFitResult): Fitted frcmod path and GAFF2 atom-type quartet.
     """
     import parmed
-    from .amber_apps import run_paramfit
+    from .amber_apps import run_paramfit, parse_paramfit_k
     from ..utils.file_ops import XYZContents
     from ..utils.pydantic_models import TorsionFitResult
 
@@ -331,7 +352,7 @@ def fit_torsions_app(scan: TorsionScanResult,
     a, b, c, d = (parm.atoms[idx].type for idx in scan.torsion)
 
     def write_job_ctrl(path: Path, *, param_file: Path | None=None,
-                       frcmod_out: Path | None=None) -> None:
+                       frcmod_out: Path | None=None, k_value: float | None=None) -> None:
         lines = [
             'RUNTYPE=FIT',
             f'NSTRUCTURES={len(scan.points)}',
@@ -348,15 +369,30 @@ def fit_torsions_app(scan: TorsionScanResult,
                       f'PARAMETER_FILE_NAME={param_file}']
         else:
             lines.append('PARAMETERS_TO_FIT=K_ONLY')
+        # Seed the fitted QM/MM energy offset K from the K_ONLY pre-pass. Without
+        # it the LOAD fit uses K=0 as its baseline, shifting the whole MM energy
+        # surface and biasing the fitted V_n. This is the documented paramfit
+        # dihedral workflow (K_ONLY -> record K -> main fit with K set).
+        if k_value is not None:
+            lines.append(f'K={k_value}')
         if frcmod_out is not None:
             lines.append(f'WRITE_FRCMOD={frcmod_out}')
         path.write_text('\n'.join(lines) + '\n')
 
     # Pass 1: K_ONLY - fit the QM/MM energy offset
     fit_k = work / 'fit_K.in'
+    fit_k_log = work / 'fit_K.log'
     write_job_ctrl(fit_k)
-    if not run_paramfit(fit_k, prmtop, mdcrd, qm_energies, work / 'fit_K.log', amberhome):
+    if not run_paramfit(fit_k, prmtop, mdcrd, qm_energies, fit_k_log, amberhome):
         return TorsionFitResult(torsion=scan.torsion, atom_types=(a, b, c, d))
+
+    # Recover K from the pre-pass log so pass 2 can hold it fixed. If parsing
+    # fails (paramfit's exact wording varies by version) we fall back to the old
+    # behaviour -- pass 2 without an explicit K -- rather than guessing.
+    k_value = parse_paramfit_k(fit_k_log)
+    if k_value is None:
+        print('Warning: could not parse K from the paramfit K_ONLY log; '
+              'proceeding without an explicit energy offset.')
 
     # Pass 2: LOAD - fit V_n / phase for each periodicity
     param_file = work / 'params.in'
@@ -369,7 +405,7 @@ def fit_torsions_app(scan: TorsionScanResult,
 
     frcmod_out = work / 'fit.frcmod'
     fit_in = work / 'fit.in'
-    write_job_ctrl(fit_in, param_file=param_file, frcmod_out=frcmod_out)
+    write_job_ctrl(fit_in, param_file=param_file, frcmod_out=frcmod_out, k_value=k_value)
     success = run_paramfit(fit_in, prmtop, mdcrd, qm_energies, work / 'fit.log', amberhome)
 
     return TorsionFitResult(
@@ -378,16 +414,57 @@ def fit_torsions_app(scan: TorsionScanResult,
         frcmod_file=frcmod_out if success else None,
     )
 
+def _converge_scf(mf, label: str):
+    """Run ``mf.kernel()`` and guarantee it converged.
+
+    A non-converged SCF still returns a number, which then silently corrupts
+    every downstream quantity (optimized energy, ESP, torsion surface). Following
+    the project's PySCF guidance, retry once with the second-order Newton solver
+    on failure, then raise if it still hasn't converged so bad numbers never
+    propagate. The Newton retry is guarded because not every gpu4pyscf mean-field
+    exposes ``.newton()``; if it doesn't, we still raise on non-convergence.
+
+    Arguments:
+        mf: A configured (but not yet run) PySCF/gpu4pyscf mean-field object.
+        label (str): Human-readable tag for the log/error message.
+
+    Returns:
+        A tuple ``(mf, energy)`` of the converged mean-field (possibly the Newton
+        object) and its total energy.
+
+    Raises:
+        RuntimeError: If the SCF fails to converge even after the Newton retry.
+    """
+    energy = mf.kernel()
+    if not getattr(mf, 'converged', True):
+        print(f'Warning: {label} SCF did not converge; retrying with Newton.')
+        try:
+            mf = mf.newton()
+            energy = mf.kernel()
+        except Exception as exc:  # noqa: BLE001 - newton may be absent on GPU
+            print(f'Warning: {label} Newton retry unavailable/failed: {exc}')
+        if not getattr(mf, 'converged', False):
+            raise RuntimeError(f'{label} SCF failed to converge.')
+    # gpu4pyscf may hand back a 0-d CuPy scalar; float() forces a host Python
+    # float so it validates cleanly into the pydantic `float` result fields.
+    return mf, float(energy)
+
+
 def load_dft(
     geom_str: str,
     qm_config: QMConfig,
     verbose: int,
     max_memory: int,
     symmetry: bool=True,
-    gpu: bool=True
+    gpu: bool=True,
+    log_file: str | Path | None=None,
 ):
     from pyscf import gto
 
+    # The Mole is always built with CPU PySCF (gpu4pyscf reuses it). Passing
+    # ``output`` redirects PySCF's own logging (SCF cycles, convergence) to that
+    # file instead of stdout, so the per-calculation log_file the callers thread
+    # in is actually written. None keeps the default (stdout).
     mol = gto.M(
         atom=geom_str,
         basis=qm_config.basis,
@@ -396,6 +473,7 @@ def load_dft(
         verbose=verbose,
         max_memory=max_memory,
         symmetry=symmetry,
+        output=str(log_file) if log_file is not None else None,
     )
 
     if gpu:
