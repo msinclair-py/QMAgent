@@ -177,3 +177,79 @@ def test_orchestrator_is_cached_not_rebuilt():
     import qmagent.llm_interface as li
 
     assert li.orchestrator is li.orchestrator
+
+
+# --------------------------------------------------------------------------- #
+# tool-output clipping
+# --------------------------------------------------------------------------- #
+
+def test_clip_leaves_short_output_untouched():
+    from qmagent.llm_interface import _clip
+
+    assert _clip('E = -76.358207 Ha') == 'E = -76.358207 Ha'
+
+
+def test_clip_keeps_both_ends_and_says_how_much_it_dropped():
+    """QM logs are front- and back-loaded: setup at the top, answer at the bottom."""
+    from qmagent.llm_interface import _clip
+
+    text = 'SETUP-MARKER' + ('x' * 100_000) + 'CONVERGED-MARKER'
+    out = _clip(text, limit=1000)
+
+    assert 'SETUP-MARKER' in out, 'lost the head of the output'
+    assert 'CONVERGED-MARKER' in out, 'lost the tail -- where the answer lives'
+    assert 'clipped' in out
+    assert len(out) < 2000
+    # The model must be able to tell "that was all" from "there was more".
+    assert '100,0' in out or 'characters clipped' in out
+
+
+def test_clip_preserves_a_traceback_tail():
+    """A failing snippet's traceback must survive: it is the whole point of the retry."""
+    from qmagent.llm_interface import _clip
+
+    noise = '\n'.join(f'  cycle {i}  E = -76.35' for i in range(5000))
+    text = noise + '\nTraceback (most recent call last):\nValueError: bad basis'
+    out = _clip(text, limit=1000)
+
+    assert 'ValueError: bad basis' in out
+
+
+def test_run_code_clips_what_it_returns_to_the_model(tmp_path):
+    """A chatty snippet must not put its whole log into the conversation.
+
+    Tool output is re-sent on every later request, so one verbose optimizer log
+    is paid for once per remaining turn -- the compounding that took a real run
+    to 1.53M input tokens, 99% of it re-sent context.
+    """
+    from qmagent.llm_interface import MAX_TOOL_OUTPUT_CHARS
+
+    returned: list[str] = []
+
+    class _FakeAgent:
+        async def execute_code(self, code, workdir=None, extra_paths=None,
+                               timeout=None):
+            # Roughly one real geomeTRIC optimization log, several times over.
+            return {'stdout': 'A' + ('geomeTRIC iteration noise ' * 20_000) + 'Z',
+                    'stderr': '', 'returncode': '0'}
+
+    def respond(messages, info: AgentInfo) -> ModelResponse:
+        for m in messages:
+            for part in getattr(m, 'parts', []) or []:
+                if getattr(part, 'part_kind', '') == 'tool-return':
+                    returned.append(str(part.content))
+        if not returned:
+            return ModelResponse(parts=[ToolCallPart(
+                tool_name='run_code', args={'code': 'print("noisy")'})])
+        return ModelResponse(parts=[TextPart('done')])
+
+    deps = QMDeps(qm=_FakeAgent(), output_path=tmp_path, resname='LIG')
+    with orchestrator.override(model=FunctionModel(respond)):
+        orchestrator.run_sync('run it', deps=deps, output_type=str)
+
+    assert returned, 'run_code never returned anything to the model'
+    body = returned[0]
+    # ~500k chars of stdout must not reach the conversation intact.
+    assert len(body) < MAX_TOOL_OUTPUT_CHARS + 2000, (
+        f'run_code returned {len(body):,} chars unclipped')
+    assert 'clipped' in body

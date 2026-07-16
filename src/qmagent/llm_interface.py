@@ -36,7 +36,31 @@ Torsion = tuple[int, int, int, int]
 
 # Context-window threshold at which the summarization capability compacts history.
 # Distinct from ModelSettings.max_tokens, which caps a single response's output.
+#
+# This is an *overflow guard*, not a cost control, and it is worth being clear
+# about which. Measured across three real runs it never fired once -- the most
+# expensive task (28 requests, 1.53M input tokens) peaked around 97k on its final
+# request, comfortably under the threshold. Compaction is what stops a long
+# parameterization run walking off the end of the context window; it is not what
+# makes a run cheap. See MAX_TOOL_OUTPUT_CHARS for the thing that actually drives
+# the token bill.
 context_max_tokens = 120_000
+
+# Cap on the stdout/stderr a single run_code call puts into the conversation.
+#
+# Tool output is the dominant cost in a QM agent, and it compounds: whatever a
+# tool returns is re-sent with every subsequent request, so one verbose call is
+# paid for once per remaining turn. The output is not small -- a *tiny* geomeTRIC
+# optimization (sto-3g water, 5 steps) prints ~1,800 tokens of banner and
+# per-iteration tables, and a real def2-TZVP saddle-point search prints several
+# times that. At ~30 run_code calls per task, returning it all verbatim is what
+# took the CH4 + .OH run to 1.53M input tokens, 99% of it re-sent context.
+#
+# 12000 chars is ~3k tokens: enough to see a traceback or a results block whole,
+# while refusing to let one chatty optimizer log ride along for the rest of the
+# run. Head and tail are kept because the interesting parts of QM output live at
+# both ends (what was set up; what it converged to).
+MAX_TOOL_OUTPUT_CHARS = 12_000
 
 
 @dataclass
@@ -102,6 +126,37 @@ system_prompt = (
     'You have access to a suite of modern QM tools and workflows, utilizing the pyscf and gpu4pyscf '
     'ecosystems, as well as python libraries including but not limited to rdkit, openbabel and ambertools.'
 )
+
+def _clip(text: str, limit: int = MAX_TOOL_OUTPUT_CHARS) -> str:
+    """Clip tool output to ``limit`` chars, keeping the head and the tail.
+
+    QM logs are front- and back-loaded: the setup (geometry, basis, functional)
+    is at the top and the answer (converged energy, final table, traceback) is at
+    the bottom, with hundreds of lines of per-iteration noise between. Middle-out
+    clipping keeps both ends and says plainly how much it dropped, so the model
+    can tell the difference between "that is all of it" and "there was more".
+
+    Arguments:
+        text (str): The raw captured output.
+        limit (int): Defaults to MAX_TOOL_OUTPUT_CHARS. Maximum characters kept.
+
+    Returns:
+        (str): ``text`` unchanged when short enough, else head + marker + tail.
+    """
+    if len(text) <= limit:
+        return text
+
+    half = limit // 2
+    dropped = len(text) - 2 * half
+    return (
+        f'{text[:half]}\n'
+        f'\n... [{dropped:,} characters clipped from the middle of this output. '
+        f'Tool output is re-sent to the model on every later step, so print only '
+        f'what you need -- set verbose=0, or write bulk output to a file in the '
+        f'working directory and read back just the part you want.] ...\n\n'
+        f'{text[-half:]}'
+    )
+
 
 def _resolve_deferred(ctx: RunContext[QMDeps],
                       requests: DeferredToolRequests) -> DeferredToolResults:
@@ -314,17 +369,20 @@ async def run_code(ctx: RunContext[QMDeps], code: str,
     # returncode is the authoritative success signal: a raised exception exits
     # non-zero with its traceback on stderr. stderr alone is not treated as
     # failure -- libraries write benign warnings there on a clean (0) run.
+    # Clip both paths: a failing snippet's stdout is just as capable of burying
+    # the traceback (and the context) as a successful one's.
     if returncode not in ('', '0'):
         raise ModelRetry(
             f'Code execution failed (returncode {returncode}).\n'
-            f'--- STDOUT ---\n{stdout or "(empty)"}\n'
-            f'--- STDERR ---\n{stderr or "(empty)"}\n'
+            f'--- STDOUT ---\n{_clip(stdout) or "(empty)"}\n'
+            f'--- STDERR ---\n{_clip(stderr) or "(empty)"}\n'
             'Read the traceback above, fix the snippet, and try again.'
         )
 
-    out = f'Code executed successfully (returncode {returncode}).\n--- STDOUT ---\n{stdout or "(empty)"}'
+    out = (f'Code executed successfully (returncode {returncode}).\n'
+           f'--- STDOUT ---\n{_clip(stdout) or "(empty)"}')
     if stderr.strip():
-        out += f'\n--- STDERR (warnings) ---\n{stderr}'
+        out += f'\n--- STDERR (warnings) ---\n{_clip(stderr)}'
     return out
 
 async def build_compound(ctx: RunContext[QMDeps], smiles: str, max_iters: int = 2000) -> str:
