@@ -5,15 +5,19 @@ from pathlib import Path
 from pydantic import BaseModel
 from pydantic_ai import Agent as PydanticAgent
 from pydantic_ai import ModelSettings, ModelRetry, RunContext
-from pydantic_ai.capabilities import Thinking, ToolSearch, WebSearch
-from pydantic_ai_backends import ConsoleCapability, LocalBackend, ensure_async
-from pydantic_ai_backends.permissions import READONLY_RULESET
+from pydantic_ai.capabilities import (
+    HandleDeferredToolCalls,
+    Thinking,
+    ToolSearch,
+    WebSearch,
+)
+from pydantic_ai.tools import DeferredToolRequests, DeferredToolResults, ToolDenied
+from pydantic_ai_backends import LocalBackend, ensure_async
 from pydantic_ai_shields import CostTracking, InputGuard, SecretRedaction, ToolGuard
 from pydantic_ai_skills import SkillsCapability
 from pydantic_ai_summarization import ContextManagerCapability
 from pydantic_ai_todo import TodoCapability, AsyncMemoryStorage
 from pydantic_deep import MemoryCapability, StuckLoopDetection
-from subagents_pydantic_ai import SubAgentCapability, SubAgentConfig
 from typing import Any, TypeVar
 
 from .utils.file_ops import XYZContents
@@ -32,7 +36,31 @@ Torsion = tuple[int, int, int, int]
 
 # Context-window threshold at which the summarization capability compacts history.
 # Distinct from ModelSettings.max_tokens, which caps a single response's output.
+#
+# This is an *overflow guard*, not a cost control, and it is worth being clear
+# about which. Measured across three real runs it never fired once -- the most
+# expensive task (28 requests, 1.53M input tokens) peaked around 97k on its final
+# request, comfortably under the threshold. Compaction is what stops a long
+# parameterization run walking off the end of the context window; it is not what
+# makes a run cheap. See MAX_TOOL_OUTPUT_CHARS for the thing that actually drives
+# the token bill.
 context_max_tokens = 120_000
+
+# Cap on the stdout/stderr a single run_code call puts into the conversation.
+#
+# Tool output is the dominant cost in a QM agent, and it compounds: whatever a
+# tool returns is re-sent with every subsequent request, so one verbose call is
+# paid for once per remaining turn. The output is not small -- a *tiny* geomeTRIC
+# optimization (sto-3g water, 5 steps) prints ~1,800 tokens of banner and
+# per-iteration tables, and a real def2-TZVP saddle-point search prints several
+# times that. At ~30 run_code calls per task, returning it all verbatim is what
+# took the CH4 + .OH run to 1.53M input tokens, 99% of it re-sent context.
+#
+# 12000 chars is ~3k tokens: enough to see a traceback or a results block whole,
+# while refusing to let one chatty optimizer log ride along for the rest of the
+# run. Head and tail are kept because the interesting parts of QM output live at
+# both ends (what was set up; what it converged to).
+MAX_TOOL_OUTPUT_CHARS = 12_000
 
 
 @dataclass
@@ -53,10 +81,8 @@ class QMDeps:
     mol2_file: Path | None = None
     amber_config: AMBERConfig | None = None
     artifacts: dict[str, Any] = field(default_factory=dict)  # id -> result object
-    # Filesystem backend shared by ConsoleCapability (grep/glob/ls/read) and
-    # MemoryCapability. Must be async: the memory toolset awaits read_bytes/read
-    # directly, while the console toolset wraps with ensure_async either way.
-    # Read-only enforcement lives in the capability's READONLY_RULESET, not here.
+    # Filesystem backend for MemoryCapability. Must be async: the memory toolset
+    # awaits read_bytes/read directly.
     backend: Any = field(default_factory=lambda: ensure_async(LocalBackend()))
 
     def put(self, kind: str, obj: Any) -> str:
@@ -101,42 +127,188 @@ system_prompt = (
     'ecosystems, as well as python libraries including but not limited to rdkit, openbabel and ambertools.'
 )
 
-research_subagent_prompt = (
-    'You are a thorough researcher that has deep expertise in '
-    'chemistry. You have strong literature parsing and synthesis '
-    'skills and are able to identify the optimal quantum chemistry '
-    'workflows and pipelines based on previous experiments reported '
-    'in the scientific literature.'
-)
+def _clip(text: str, limit: int = MAX_TOOL_OUTPUT_CHARS) -> str:
+    """Clip tool output to ``limit`` chars, keeping the head and the tail.
 
-orchestrator = PydanticAgent[QMDeps, ParameterizationSummary](
-    model,
-    deps_type=QMDeps,
-    output_type=ParameterizationSummary,
-    model_settings=ModelSettings(temperature=0.8, max_tokens=10000),
-    instructions=system_prompt,  # instructions (not system_prompt) so only the current agent's prompt reaches the model
-    capabilities=[
-        ToolSearch(),
-        Thinking('xhigh'),
-        ContextManagerCapability(max_tokens=context_max_tokens),
-        WebSearch(),
-        ConsoleCapability(permissions=READONLY_RULESET),  # grep, glob, ls, read
-        MemoryCapability(agent_name='quantum-agent'),
-        SkillsCapability(directories=['./skills']),
-        SubAgentCapability(subagents=[
-            SubAgentConfig(
-                name='researcher',
-                description='Deep research on a topic',
-                instructions=research_subagent_prompt
-            ),
-        ]),
-        TodoCapability(enable_subtasks=True, async_storage=AsyncMemoryStorage()),
-        InputGuard(guard=lambda p: 'ignore previous instructions' not in p.lower()),
-        ToolGuard(blocked=['rm']),
-        SecretRedaction(),
-        StuckLoopDetection(),
-    ]
-)
+    QM logs are front- and back-loaded: the setup (geometry, basis, functional)
+    is at the top and the answer (converged energy, final table, traceback) is at
+    the bottom, with hundreds of lines of per-iteration noise between. Middle-out
+    clipping keeps both ends and says plainly how much it dropped, so the model
+    can tell the difference between "that is all of it" and "there was more".
+
+    Arguments:
+        text (str): The raw captured output.
+        limit (int): Defaults to MAX_TOOL_OUTPUT_CHARS. Maximum characters kept.
+
+    Returns:
+        (str): ``text`` unchanged when short enough, else head + marker + tail.
+    """
+    if len(text) <= limit:
+        return text
+
+    half = limit // 2
+    dropped = len(text) - 2 * half
+    return (
+        f'{text[:half]}\n'
+        f'\n... [{dropped:,} characters clipped from the middle of this output. '
+        f'Tool output is re-sent to the model on every later step, so print only '
+        f'what you need -- set verbose=0, or write bulk output to a file in the '
+        f'working directory and read back just the part you want.] ...\n\n'
+        f'{text[-half:]}'
+    )
+
+
+def _resolve_deferred(ctx: RunContext[QMDeps],
+                      requests: DeferredToolRequests) -> DeferredToolResults:
+    """Deny approval-required tool calls instead of letting them kill the run.
+
+    When a toolset registers a tool with ``requires_approval=True`` and nothing
+    can answer the approval request, pydantic-ai raises ``UserError`` ("a
+    deferred tool call was present, but DeferredToolRequests is not among output
+    types") and the entire run dies, discarding all work and spend. That is not
+    a hypothetical: a CH4 + .OH barrier task died this way twice, ~1.5M tokens in
+    each time, after reaching for ConsoleCapability's ``run_in_background``.
+
+    ConsoleCapability has since been dropped, so nothing in the capability list
+    below demands approval today. This stays as a floor: the failure mode is
+    catastrophic and silent-until-fatal, the guard costs nothing (it adds no
+    tool schema), and any capability added later could reintroduce it.
+
+    This agent runs unattended, so there is no human to approve anything.
+    Denying with an explanatory message keeps the run alive and points the model
+    at ``run_code``, which covers the legitimate uses.
+
+    Arguments:
+        ctx (RunContext[QMDeps]): The active run context.
+        requests (DeferredToolRequests): Calls awaiting approval or external
+            execution.
+
+    Returns:
+        (DeferredToolResults): A denial for every pending call.
+    """
+    results = DeferredToolResults()
+
+    for call in requests.approvals:
+        results.approvals[call.tool_call_id] = ToolDenied(
+            message=(
+                f'{call.tool_name!r} needs approval, but this agent runs '
+                f'unattended with no one to grant it, and its filesystem '
+                f'permissions are read-only. Use run_code for anything that '
+                f'must execute code or write files -- it runs in a sandboxed '
+                f'subprocess in the run output directory.'
+            )
+        )
+
+    # Externally-executed tools: nothing here can execute them, so return the
+    # reason as the tool's result rather than stalling the run.
+    for call in requests.calls:
+        results.calls[call.tool_call_id] = (
+            f'{call.tool_name!r} requires external execution, which this '
+            f'deployment does not provide. Use run_code instead.'
+        )
+
+    return results
+
+
+def _build_orchestrator() -> PydanticAgent[QMDeps, ParameterizationSummary]:
+    """Construct the coordinator agent and register its tools.
+
+    Called lazily by the module's ``__getattr__`` the first time ``orchestrator``
+    is accessed, and cached thereafter. Constructing an Agent resolves its model
+    string through ``infer_model``, which builds the provider and therefore
+    demands a credential *exist*. Doing that at module import made ``import
+    qmagent.llm_interface`` fail outright with a ``UserError`` on any machine
+    without ``OPENAI_API_KEY`` -- so the data models, the deps dataclass and the
+    tool functions could not be imported or tested offline, and even ``--help``
+    needed an API key.
+
+    Deferring it means a credential is required when you actually build the
+    agent (i.e. when you are about to run it), not when you import the module
+    that defines it.
+
+    Returns:
+        (PydanticAgent): The configured coordinator agent.
+    """
+    agent = PydanticAgent[QMDeps, ParameterizationSummary](
+        model,
+        deps_type=QMDeps,
+        output_type=ParameterizationSummary,
+        # No temperature: `model` is a reasoning model, and providers reject or
+        # drop sampling parameters when reasoning is enabled ("Sampling
+        # parameters ['temperature'] are not supported when reasoning is
+        # enabled. These settings will be ignored."). Setting it read as a
+        # deliberate diversity knob while doing nothing. Re-add it only
+        # alongside a non-reasoning model.
+        model_settings=ModelSettings(max_tokens=10000),
+        # instructions (not system_prompt) so only the current agent's prompt
+        # reaches the model
+        instructions=system_prompt,
+        capabilities=[
+            ToolSearch(),
+            Thinking('xhigh'),
+            ContextManagerCapability(max_tokens=context_max_tokens),
+            WebSearch(),
+            # Deliberately NOT here (measured over three real runs, see below):
+            #
+            # ConsoleCapability -- 23 calls, all ls/read_file/grep/glob, which
+            #   run_code already does from inside the run's output directory. It
+            #   also advertised write_file/execute/run_in_background despite the
+            #   READONLY_RULESET name, and the one run_in_background call killed
+            #   a run outright (~1.5M tokens). ~1,400 tokens of schema per
+            #   request to duplicate run_code and carry a trapdoor.
+            #
+            # SubAgentCapability -- 0 calls. Never once delegated to the
+            #   'researcher' subagent. It cost ~865 tokens of task-management
+            #   schema per request, and compiling its sub-agent at import is
+            #   what made this module unimportable without a credential.
+            MemoryCapability(agent_name='quantum-agent'),
+            SkillsCapability(directories=['./skills']),
+            TodoCapability(enable_subtasks=True, async_storage=AsyncMemoryStorage()),
+            InputGuard(guard=lambda p: 'ignore previous instructions' not in p.lower()),
+            ToolGuard(blocked=['rm']),
+            SecretRedaction(),
+            StuckLoopDetection(),
+            # Must be present whenever a toolset registers approval-required tools
+            # (ConsoleCapability does). Without it the first such call raises
+            # UserError and kills the run outright -- see _resolve_deferred.
+            HandleDeferredToolCalls(_resolve_deferred),
+        ],
+    )
+
+    # Registered here rather than via @orchestrator.tool decorators: the agent
+    # no longer exists at module import time.
+    for tool in (
+        run_code,
+        build_compound,
+        geometry_optimization,
+        compute_esp,
+        scan_torsions,
+        fit_resp_charges,
+        integrate_amber_ff,
+        fit_torsions,
+        run_parameterization_pipeline,
+    ):
+        agent.tool(tool)
+
+    return agent
+
+
+_orchestrator: PydanticAgent[QMDeps, ParameterizationSummary] | None = None
+
+
+def __getattr__(name: str) -> Any:
+    """Build ``orchestrator`` on first access, then cache it (PEP 562).
+
+    Keeps ``from qmagent.llm_interface import QMDeps`` (and the tool functions,
+    and ParameterizationSummary) working with no provider credential, while
+    ``orchestrator`` itself still resolves normally for anyone about to run it.
+    """
+    if name == 'orchestrator':
+        global _orchestrator
+        if _orchestrator is None:
+            _orchestrator = _build_orchestrator()
+        return _orchestrator
+    raise AttributeError(f'module {__name__!r} has no attribute {name!r}')
 
 
 # --------------------------------------------------------------------------- #
@@ -145,8 +317,8 @@ orchestrator = PydanticAgent[QMDeps, ParameterizationSummary](
 # echoing large structured objects.
 # --------------------------------------------------------------------------- #
 
-@orchestrator.tool
-async def run_code(ctx: RunContext[QMDeps], code: str) -> str:
+async def run_code(ctx: RunContext[QMDeps], code: str,
+                   timeout: float = 1800.0) -> str:
     """Execute an arbitrary Python snippet on the QMAgent for bespoke analysis.
 
     The snippet runs in an isolated subprocess on the agent (sharing its
@@ -164,6 +336,11 @@ async def run_code(ctx: RunContext[QMDeps], code: str) -> str:
     Arguments:
         code (str): A multi-line Python snippet. Anything it prints to stdout is
             returned to you; if it raises, the traceback comes back in stderr.
+        timeout (float): Defaults to 1800 (30 min). Wall-clock seconds before the
+            snippet is killed. Raise it for genuinely long work -- a saddle-point
+            search, a Hessian, a multi-point scan -- rather than trying to move
+            the job off this tool; this is the only sandbox available, and there
+            is no background execution to escape to.
 
     Returns:
         (str): The captured stdout and stderr. On failure the Python traceback
@@ -182,6 +359,7 @@ async def run_code(ctx: RunContext[QMDeps], code: str) -> str:
         code,
         workdir=ctx.deps.output_path,
         extra_paths=extra_paths,
+        timeout=timeout,
     )
 
     stdout = result.get('stdout', '')
@@ -191,20 +369,22 @@ async def run_code(ctx: RunContext[QMDeps], code: str) -> str:
     # returncode is the authoritative success signal: a raised exception exits
     # non-zero with its traceback on stderr. stderr alone is not treated as
     # failure -- libraries write benign warnings there on a clean (0) run.
+    # Clip both paths: a failing snippet's stdout is just as capable of burying
+    # the traceback (and the context) as a successful one's.
     if returncode not in ('', '0'):
         raise ModelRetry(
             f'Code execution failed (returncode {returncode}).\n'
-            f'--- STDOUT ---\n{stdout or "(empty)"}\n'
-            f'--- STDERR ---\n{stderr or "(empty)"}\n'
+            f'--- STDOUT ---\n{_clip(stdout) or "(empty)"}\n'
+            f'--- STDERR ---\n{_clip(stderr) or "(empty)"}\n'
             'Read the traceback above, fix the snippet, and try again.'
         )
 
-    out = f'Code executed successfully (returncode {returncode}).\n--- STDOUT ---\n{stdout or "(empty)"}'
+    out = (f'Code executed successfully (returncode {returncode}).\n'
+           f'--- STDOUT ---\n{_clip(stdout) or "(empty)"}')
     if stderr.strip():
-        out += f'\n--- STDERR (warnings) ---\n{stderr}'
+        out += f'\n--- STDERR (warnings) ---\n{_clip(stderr)}'
     return out
 
-@orchestrator.tool
 async def build_compound(ctx: RunContext[QMDeps], smiles: str, max_iters: int = 2000) -> str:
     """Embed a SMILES string into a 3D conformer and write a model-compound mol2.
 
@@ -226,7 +406,6 @@ async def build_compound(ctx: RunContext[QMDeps], smiles: str, max_iters: int = 
     return f'Built {smiles} -> {mol2_file.name} (resname {deps.resname})'
 
 
-@orchestrator.tool
 async def geometry_optimization(ctx: RunContext[QMDeps],
                                 stages: list[QMConfig],
                                 constraints: str | None = None,
@@ -259,7 +438,6 @@ async def geometry_optimization(ctx: RunContext[QMDeps],
     return f'{gid}: optimized, final energy {result.energy:.6f} Ha, xyz={result.xyz_file.name}'
 
 
-@orchestrator.tool
 async def compute_esp(ctx: RunContext[QMDeps], geomopt_key: str, qm_config: QMConfig) -> str:
     """Compute the QM electrostatic potential (gas + solvent) on an MK grid.
 
@@ -284,7 +462,6 @@ async def compute_esp(ctx: RunContext[QMDeps], geomopt_key: str, qm_config: QMCo
     return f'{eid}: {len(result)} ESP calculations (gas + solvent) on the MK grid'
 
 
-@orchestrator.tool
 async def scan_torsions(ctx: RunContext[QMDeps],
                         geomopt_key: str,
                         qm_config: QMConfig,
@@ -322,7 +499,6 @@ async def scan_torsions(ctx: RunContext[QMDeps],
     return msg
 
 
-@orchestrator.tool
 async def fit_resp_charges(ctx: RunContext[QMDeps],
                            geomopt_key: str,
                            esp_key: str,
@@ -360,7 +536,6 @@ async def fit_resp_charges(ctx: RunContext[QMDeps],
     return f'{rid}: RESP2(delta={delta_resp2}) charges fit, total charge {total:+.4f} e'
 
 
-@orchestrator.tool
 async def integrate_amber_ff(ctx: RunContext[QMDeps],
                              resp_key: str,
                              charge: int | None = None) -> str:
@@ -416,7 +591,6 @@ async def integrate_amber_ff(ctx: RunContext[QMDeps],
             f'prmtop={result.prmtop.name}')
 
 
-@orchestrator.tool
 async def fit_torsions(ctx: RunContext[QMDeps],
                        torsionscan_key: str,
                        max_periodicity: int = 4) -> str:
@@ -448,7 +622,6 @@ async def fit_torsions(ctx: RunContext[QMDeps],
             f'refined frcmod={result.refined_frcmod.name}')
 
 
-@orchestrator.tool
 async def run_parameterization_pipeline(ctx: RunContext[QMDeps],
                                         smiles: str,
                                         optimization_stages: list[QMConfig],

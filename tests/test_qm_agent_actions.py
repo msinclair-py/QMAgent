@@ -190,3 +190,54 @@ def test_fit_resp_charges_bad_phase_counts_raise(agent, tmp_path, flags):
                 qm_config=_qm_config(),
             )
         )
+
+
+# --------------------------------------------------------------------------- #
+# find_rotatable_torsions
+# --------------------------------------------------------------------------- #
+
+@pytest.fixture
+def butane_mol2(tmp_path):
+    """n-butane as a mol2 with explicit hydrogens.
+
+    The discriminating case: three bonds match the rotatable SMARTS, but only
+    the central C-C joins two non-terminal heavy atoms. The other two are
+    methyl rotors.
+    """
+    from rdkit import Chem
+    from rdkit.Chem import AllChem
+
+    from qmagent.utils.file_ops import write_mol2
+
+    mol = Chem.AddHs(Chem.MolFromSmiles("CCCC"))
+    assert AllChem.EmbedMolecule(mol, randomSeed=42) == 0
+    path = tmp_path / "butane.mol2"
+    write_mol2(mol, path, "BUT")
+    return path
+
+
+def test_find_rotatable_torsions_skips_terminal_methyl_rotors(butane_mol2):
+    # n-butane has exactly one rotatable bond: the central C1-C2. The two
+    # terminal C-C bonds are methyl rotors -- the SMARTS' own `!D1` is meant to
+    # reject them, but D1 counts explicit hydrogens, so a methyl carbon (degree
+    # 4) slips through and they were being scanned too.
+    agent = QMAgent(num_threads=1)
+    torsions = asyncio.run(agent.find_rotatable_torsions(mol2_file=butane_mol2))
+
+    assert len(torsions) == 1, f"expected 1 rotatable bond in butane, got {torsions}"
+
+    from rdkit import Chem
+    mol = Chem.MolFromMol2File(str(butane_mol2), removeHs=False, sanitize=True)
+    (_, b, c, _), = torsions
+    # Both central atoms must be carbons with two heavy neighbours.
+    for idx in (b, c):
+        atom = mol.GetAtomWithIdx(idx)
+        heavy = sum(1 for n in atom.GetNeighbors() if n.GetAtomicNum() > 1)
+        assert atom.GetSymbol() == "C" and heavy == 2
+
+
+def test_find_rotatable_torsions_ethane_has_none(ethane_mol2):
+    # Ethane is two methyls: no bond joins two non-terminal heavy atoms, so
+    # there is nothing worth scanning (RDKit's own NumRotatableBonds agrees).
+    agent = QMAgent(num_threads=1)
+    assert asyncio.run(agent.find_rotatable_torsions(mol2_file=ethane_mol2)) == set()
