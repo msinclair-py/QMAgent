@@ -24,21 +24,36 @@ from qmagent.llm_interface import QMDeps, orchestrator  # noqa: E402
 def test_approval_required_tool_call_does_not_kill_the_run(tmp_path):
     """A tool that demands approval must be denied, not crash the whole run.
 
-    ConsoleCapability registers run_in_background/execute/write_file with
-    requires_approval=True. With no deferred-call handler, pydantic-ai raises
-    UserError ("a deferred tool call was present, but DeferredToolRequests is
-    not among output types") and the run dies -- discarding every result and
-    every token already spent. Regression guard for that crash.
+    Any toolset may register a tool with requires_approval=True. Without a
+    deferred-call handler, the first such call makes pydantic-ai raise UserError
+    ("a deferred tool call was present, but DeferredToolRequests is not among
+    output types") and the run dies, discarding every result and every token
+    already spent. That is exactly how the CH4 + .OH barrier task died, twice,
+    ~1.5M tokens in, when it reached for ConsoleCapability's run_in_background.
+
+    ConsoleCapability has since been removed, so nothing in the stock capability
+    list demands approval any more -- which would make a test that leans on it
+    vacuous (it would pass with the handler deleted). Register an
+    approval-required tool explicitly instead, so this keeps guarding the
+    handler itself rather than a capability that happens to be absent.
     """
+    from pydantic_ai import RunContext
+    from pydantic_ai.toolsets import FunctionToolset
+
+    extra = FunctionToolset()
+
+    @extra.tool(requires_approval=True)
+    def launch_detached_job(ctx: RunContext[QMDeps], command: str) -> str:
+        """Stand-in for any tool a toolset marks requires_approval=True."""
+        raise AssertionError('a denied tool must never actually execute')
+
     calls: list[str] = []
 
     def respond(messages, info: AgentInfo) -> ModelResponse:
         if not calls:
-            # First turn: reach for an approval-required console tool, exactly
-            # as the model did on the CH4 + .OH barrier task.
-            calls.append('run_in_background')
+            calls.append('launch_detached_job')
             return ModelResponse(parts=[ToolCallPart(
-                tool_name='run_in_background',
+                tool_name='launch_detached_job',
                 args={'command': 'python long_running_qm.py'},
             )])
         # Second turn: having been denied, answer normally.
@@ -47,13 +62,13 @@ def test_approval_required_tool_call_does_not_kill_the_run(tmp_path):
     deps = QMDeps(qm=None, output_path=tmp_path, resname='LIG')
 
     with orchestrator.override(model=FunctionModel(respond)):
-        # The assertion is that this does not raise UserError. The output type
-        # is irrelevant here, so take free-form text.
+        # The assertion is that this does not raise UserError.
         result = orchestrator.run_sync(
-            'start a long job in the background', deps=deps, output_type=str,
+            'start a long job in the background', deps=deps,
+            output_type=str, toolsets=[extra],
         )
 
-    assert calls == ['run_in_background'], 'the approval-required tool was never called'
+    assert calls == ['launch_detached_job'], 'the approval-required tool was never called'
     assert isinstance(result.output, str)
 
 

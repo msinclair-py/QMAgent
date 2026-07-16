@@ -12,14 +12,12 @@ from pydantic_ai.capabilities import (
     WebSearch,
 )
 from pydantic_ai.tools import DeferredToolRequests, DeferredToolResults, ToolDenied
-from pydantic_ai_backends import ConsoleCapability, LocalBackend, ensure_async
-from pydantic_ai_backends.permissions import READONLY_RULESET
+from pydantic_ai_backends import LocalBackend, ensure_async
 from pydantic_ai_shields import CostTracking, InputGuard, SecretRedaction, ToolGuard
 from pydantic_ai_skills import SkillsCapability
 from pydantic_ai_summarization import ContextManagerCapability
 from pydantic_ai_todo import TodoCapability, AsyncMemoryStorage
 from pydantic_deep import MemoryCapability, StuckLoopDetection
-from subagents_pydantic_ai import SubAgentCapability, SubAgentConfig
 from typing import Any, TypeVar
 
 from .utils.file_ops import XYZContents
@@ -59,10 +57,8 @@ class QMDeps:
     mol2_file: Path | None = None
     amber_config: AMBERConfig | None = None
     artifacts: dict[str, Any] = field(default_factory=dict)  # id -> result object
-    # Filesystem backend shared by ConsoleCapability (grep/glob/ls/read) and
-    # MemoryCapability. Must be async: the memory toolset awaits read_bytes/read
-    # directly, while the console toolset wraps with ensure_async either way.
-    # Read-only enforcement lives in the capability's READONLY_RULESET, not here.
+    # Filesystem backend for MemoryCapability. Must be async: the memory toolset
+    # awaits read_bytes/read directly.
     backend: Any = field(default_factory=lambda: ensure_async(LocalBackend()))
 
     def put(self, kind: str, obj: Any) -> str:
@@ -107,30 +103,25 @@ system_prompt = (
     'ecosystems, as well as python libraries including but not limited to rdkit, openbabel and ambertools.'
 )
 
-research_subagent_prompt = (
-    'You are a thorough researcher that has deep expertise in '
-    'chemistry. You have strong literature parsing and synthesis '
-    'skills and are able to identify the optimal quantum chemistry '
-    'workflows and pipelines based on previous experiments reported '
-    'in the scientific literature.'
-)
-
 def _resolve_deferred(ctx: RunContext[QMDeps],
                       requests: DeferredToolRequests) -> DeferredToolResults:
     """Deny approval-required tool calls instead of letting them kill the run.
 
-    ``ConsoleCapability`` registers its mutating tools (``run_in_background``,
-    ``execute``, ``write_file``, ...) with ``requires_approval=True``. Without a
-    handler, the first time the model calls one, pydantic-ai has nowhere to send
-    the approval request: it raises ``UserError`` ("a deferred tool call was
-    present, but DeferredToolRequests is not among output types") and the entire
-    run dies, discarding all work and spend.
+    When a toolset registers a tool with ``requires_approval=True`` and nothing
+    can answer the approval request, pydantic-ai raises ``UserError`` ("a
+    deferred tool call was present, but DeferredToolRequests is not among output
+    types") and the entire run dies, discarding all work and spend. That is not
+    a hypothetical: a CH4 + .OH barrier task died this way twice, ~1.5M tokens in
+    each time, after reaching for ConsoleCapability's ``run_in_background``.
 
-    This agent runs unattended, so there is no human to approve anything, and
-    the READONLY_RULESET it is configured with would refuse these operations at
-    call time regardless. Denying with an explanatory message keeps the run
-    alive and tells the model to route around the tool -- which it can, since
-    ``run_code`` covers the legitimate uses.
+    ConsoleCapability has since been dropped, so nothing in the capability list
+    below demands approval today. This stays as a floor: the failure mode is
+    catastrophic and silent-until-fatal, the guard costs nothing (it adds no
+    tool schema), and any capability added later could reintroduce it.
+
+    This agent runs unattended, so there is no human to approve anything.
+    Denying with an explanatory message keeps the run alive and points the model
+    at ``run_code``, which covers the legitimate uses.
 
     Arguments:
         ctx (RunContext[QMDeps]): The active run context.
@@ -170,8 +161,7 @@ def _build_orchestrator() -> PydanticAgent[QMDeps, ParameterizationSummary]:
     Called lazily by the module's ``__getattr__`` the first time ``orchestrator``
     is accessed, and cached thereafter. Constructing an Agent resolves its model
     string through ``infer_model``, which builds the provider and therefore
-    demands a credential *exist*; ``SubAgentCapability`` compiles its sub-agent
-    the same way. Doing that at module import made ``import
+    demands a credential *exist*. Doing that at module import made ``import
     qmagent.llm_interface`` fail outright with a ``UserError`` on any machine
     without ``OPENAI_API_KEY`` -- so the data models, the deps dataclass and the
     tool functions could not be imported or tested offline, and even ``--help``
@@ -203,16 +193,21 @@ def _build_orchestrator() -> PydanticAgent[QMDeps, ParameterizationSummary]:
             Thinking('xhigh'),
             ContextManagerCapability(max_tokens=context_max_tokens),
             WebSearch(),
-            ConsoleCapability(permissions=READONLY_RULESET),  # grep, glob, ls, read
+            # Deliberately NOT here (measured over three real runs, see below):
+            #
+            # ConsoleCapability -- 23 calls, all ls/read_file/grep/glob, which
+            #   run_code already does from inside the run's output directory. It
+            #   also advertised write_file/execute/run_in_background despite the
+            #   READONLY_RULESET name, and the one run_in_background call killed
+            #   a run outright (~1.5M tokens). ~1,400 tokens of schema per
+            #   request to duplicate run_code and carry a trapdoor.
+            #
+            # SubAgentCapability -- 0 calls. Never once delegated to the
+            #   'researcher' subagent. It cost ~865 tokens of task-management
+            #   schema per request, and compiling its sub-agent at import is
+            #   what made this module unimportable without a credential.
             MemoryCapability(agent_name='quantum-agent'),
             SkillsCapability(directories=['./skills']),
-            SubAgentCapability(subagents=[
-                SubAgentConfig(
-                    name='researcher',
-                    description='Deep research on a topic',
-                    instructions=research_subagent_prompt
-                ),
-            ]),
             TodoCapability(enable_subtasks=True, async_storage=AsyncMemoryStorage()),
             InputGuard(guard=lambda p: 'ignore previous instructions' not in p.lower()),
             ToolGuard(blocked=['rm']),
