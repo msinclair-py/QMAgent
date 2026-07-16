@@ -168,7 +168,12 @@ orchestrator = PydanticAgent[QMDeps, ParameterizationSummary](
     model,
     deps_type=QMDeps,
     output_type=ParameterizationSummary,
-    model_settings=ModelSettings(temperature=0.8, max_tokens=10000),
+    # No temperature: `model` is a reasoning model, and providers reject or drop
+    # sampling parameters when reasoning is enabled ("Sampling parameters
+    # ['temperature'] are not supported when reasoning is enabled. These settings
+    # will be ignored."). Setting it read as a deliberate diversity knob while
+    # doing nothing. Re-add it only alongside a non-reasoning model.
+    model_settings=ModelSettings(max_tokens=10000),
     instructions=system_prompt,  # instructions (not system_prompt) so only the current agent's prompt reaches the model
     capabilities=[
         ToolSearch(),
