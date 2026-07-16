@@ -205,7 +205,8 @@ orchestrator = PydanticAgent[QMDeps, ParameterizationSummary](
 # --------------------------------------------------------------------------- #
 
 @orchestrator.tool
-async def run_code(ctx: RunContext[QMDeps], code: str) -> str:
+async def run_code(ctx: RunContext[QMDeps], code: str,
+                   timeout: float = 1800.0) -> str:
     """Execute an arbitrary Python snippet on the QMAgent for bespoke analysis.
 
     The snippet runs in an isolated subprocess on the agent (sharing its
@@ -223,6 +224,11 @@ async def run_code(ctx: RunContext[QMDeps], code: str) -> str:
     Arguments:
         code (str): A multi-line Python snippet. Anything it prints to stdout is
             returned to you; if it raises, the traceback comes back in stderr.
+        timeout (float): Defaults to 1800 (30 min). Wall-clock seconds before the
+            snippet is killed. Raise it for genuinely long work -- a saddle-point
+            search, a Hessian, a multi-point scan -- rather than trying to move
+            the job off this tool; this is the only sandbox available, and there
+            is no background execution to escape to.
 
     Returns:
         (str): The captured stdout and stderr. On failure the Python traceback
@@ -241,6 +247,7 @@ async def run_code(ctx: RunContext[QMDeps], code: str) -> str:
         code,
         workdir=ctx.deps.output_path,
         extra_paths=extra_paths,
+        timeout=timeout,
     )
 
     stdout = result.get('stdout', '')
