@@ -517,6 +517,10 @@ class QMAgent(Agent):
         define the (i, j, k, l) dihedral to scan. Runs agent-side as it reads the
         mol2 off the agent's filesystem.
 
+        Terminal rotors (methyl, -NH2, -OH) are excluded: their barriers are tiny
+        and well covered by the GAFF2 defaults, so scanning them spends QM time
+        on torsions that carry almost no information.
+
         Arguments:
             mol2_file (Path): Path to the input mol2 file.
 
@@ -528,9 +532,24 @@ class QMAgent(Agent):
 
         pattern = Chem.MolFromSmarts('[!$(*#*)&!D1]-&!@[!$(*#*)&!D1]')
 
+        def heavy_degree(atom) -> int:
+            """Number of non-hydrogen neighbours."""
+            return sum(1 for n in atom.GetNeighbors() if n.GetAtomicNum() > 1)
+
         torsions: Torsions = set()
         for b, c in mol.GetSubstructMatches(pattern):
             b_atom, c_atom = mol.GetAtomWithIdx(b), mol.GetAtomWithIdx(c)
+
+            # The SMARTS' own `!D1` is meant to reject terminal centres, but D1
+            # counts *all* connections and this mol2 is read with explicit
+            # hydrogens -- a methyl carbon has degree 4, so it sails through.
+            # Re-apply the intended test against heavy-atom degree, which is
+            # what "non-terminal heavy-atom centre" means. Without this, ALY
+            # scans 6 torsions instead of 4 and hexane 5 instead of 3, the
+            # extras being free methyl rotors.
+            if heavy_degree(b_atom) < 2 or heavy_degree(c_atom) < 2:
+                continue
+
             a = next((n.GetIdx() for n in b_atom.GetNeighbors() if n.GetIdx() != c), None)
             d = next((n.GetIdx() for n in c_atom.GetNeighbors() if n.GetIdx() != b), None)
             if a is not None and d is not None:

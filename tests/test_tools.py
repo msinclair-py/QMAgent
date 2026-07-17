@@ -205,6 +205,85 @@ def test_run_code_treats_stderr_alone_as_warnings_not_failure(state):
     assert 'ok' in out and 'UserWarning' in out
 
 
+def test_run_code_forwards_its_timeout_to_the_agent(state):
+    """run_code must let the model choose a timeout and pass it explicitly.
+
+    execute_code's own default is 300s, which does not fit real QM: an open-shell
+    TS search plus a Hessian blows straight through it. The tool owns the policy
+    and always forwards it, so the model's escape from a too-short default is a
+    bigger timeout, not a reach for background execution."""
+    state.qm = StubHandle(execute_code={'stdout': 'ok', 'stderr': '', 'returncode': '0'})
+
+    _run(QMToolkit(state).run_code(code='print(1)', timeout=5400.0))
+
+    assert state.qm.kwargs_for('execute_code')['timeout'] == 5400.0
+
+
+def test_run_code_default_timeout_fits_real_qm():
+    """The default must be long enough for a saddle-point search plus a Hessian."""
+    import inspect
+
+    default = inspect.signature(QMToolkit.run_code).parameters['timeout'].default
+    # 300s (execute_code's own default) is empirically too short: an HCN TS
+    # search alone took ~175s at def2-SVP, and CH4 + .OH is far bigger.
+    assert default >= 1800.0
+
+
+def test_run_code_clips_what_it_returns(state):
+    """A chatty snippet must not put its whole log into the conversation.
+
+    Tool output is re-sent to the model on every later step, so one verbose
+    optimizer log is paid for once per remaining turn -- the compounding that took
+    a real run to 1.53M input tokens, 99% of it re-sent context."""
+    from qmagent.tools import MAX_TOOL_OUTPUT_CHARS
+
+    state.qm = StubHandle(execute_code={
+        'stdout': 'A' + ('geomeTRIC iteration noise ' * 20_000) + 'Z',
+        'stderr': '', 'returncode': '0',
+    })
+
+    out = _run(QMToolkit(state).run_code(code='print("noisy")'))
+
+    assert len(out) < MAX_TOOL_OUTPUT_CHARS + 2000, f'returned {len(out):,} chars unclipped'
+    assert 'clipped' in out
+
+
+# --------------------------------------------------------------------------- #
+# Tool-output clipping (_clip)
+# --------------------------------------------------------------------------- #
+
+def test_clip_leaves_short_output_untouched():
+    from qmagent.tools import _clip
+
+    assert _clip('E = -76.358207 Ha') == 'E = -76.358207 Ha'
+
+
+def test_clip_keeps_both_ends_and_says_how_much_it_dropped():
+    """QM logs are front- and back-loaded: setup at the top, answer at the bottom."""
+    from qmagent.tools import _clip
+
+    text = 'SETUP-MARKER' + ('x' * 100_000) + 'CONVERGED-MARKER'
+    out = _clip(text, limit=1000)
+
+    assert 'SETUP-MARKER' in out, 'lost the head of the output'
+    assert 'CONVERGED-MARKER' in out, 'lost the tail -- where the answer lives'
+    assert 'clipped' in out
+    assert len(out) < 2000
+    # The model must be able to tell "that was all" from "there was more".
+    assert '100,0' in out or 'characters clipped' in out
+
+
+def test_clip_preserves_a_traceback_tail():
+    """A failing snippet's traceback must survive: it is the whole point of the retry."""
+    from qmagent.tools import _clip
+
+    noise = '\n'.join(f'  cycle {i}  E = -76.35' for i in range(5000))
+    text = noise + '\nTraceback (most recent call last):\nValueError: bad basis'
+    out = _clip(text, limit=1000)
+
+    assert 'ValueError: bad basis' in out
+
+
 # --------------------------------------------------------------------------- #
 # The exposed surface
 # --------------------------------------------------------------------------- #

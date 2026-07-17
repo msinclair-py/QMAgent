@@ -40,6 +40,54 @@ from .utils.pydantic_models import (
 T = TypeVar('T')
 Torsion = tuple[int, int, int, int]
 
+# Cap on the stdout/stderr a single run_code call puts into the conversation.
+#
+# Tool output is the dominant cost in a QM agent, and it compounds: whatever a
+# tool returns is re-sent to the model on every subsequent step, so one verbose
+# call is paid for once per remaining turn -- and this bites either harness, which
+# is why the cap lives in the shared tool layer, not in one adapter. The output is
+# not small: a *tiny* geomeTRIC optimization (sto-3g water, 5 steps) prints ~1,800
+# tokens of banner and per-iteration tables, and a real def2-TZVP saddle-point
+# search prints several times that. At ~30 run_code calls per task, returning it
+# all verbatim is what took a CH4 + .OH run to 1.53M input tokens, 99% re-sent.
+#
+# 12000 chars is ~3k tokens: enough to see a traceback or a results block whole,
+# while refusing to let one chatty optimizer log ride along for the rest of the
+# run. Head and tail are kept because the interesting parts of QM output live at
+# both ends (what was set up; what it converged to).
+MAX_TOOL_OUTPUT_CHARS = 12_000
+
+
+def _clip(text: str, limit: int = MAX_TOOL_OUTPUT_CHARS) -> str:
+    """Clip tool output to ``limit`` chars, keeping the head and the tail.
+
+    QM logs are front- and back-loaded: the setup (geometry, basis, functional)
+    is at the top and the answer (converged energy, final table, traceback) is at
+    the bottom, with hundreds of lines of per-iteration noise between. Middle-out
+    clipping keeps both ends and says plainly how much it dropped, so the model
+    can tell the difference between "that is all of it" and "there was more".
+
+    Arguments:
+        text (str): The raw captured output.
+        limit (int): Defaults to MAX_TOOL_OUTPUT_CHARS. Maximum characters kept.
+
+    Returns:
+        (str): ``text`` unchanged when short enough, else head + marker + tail.
+    """
+    if len(text) <= limit:
+        return text
+
+    half = limit // 2
+    dropped = len(text) - 2 * half
+    return (
+        f'{text[:half]}\n'
+        f'\n... [{dropped:,} characters clipped from the middle of this output. '
+        f'Tool output is re-sent to the model on every later step, so print only '
+        f'what you need -- set verbose=0, or write bulk output to a file in the '
+        f'working directory and read back just the part you want.] ...\n\n'
+        f'{text[-half:]}'
+    )
+
 
 class QMToolError(Exception):
     """A problem the caller can fix and retry: a missing prerequisite, an unknown
@@ -158,7 +206,7 @@ class QMToolkit:
             self.run_parameterization_pipeline,
         )
 
-    async def run_code(self, code: str) -> str:
+    async def run_code(self, code: str, timeout: float = 1800.0) -> str:
         """Execute an arbitrary Python snippet on the QMAgent for bespoke analysis.
 
         The snippet runs in an isolated subprocess on the agent (sharing its
@@ -176,11 +224,16 @@ class QMToolkit:
         Arguments:
             code (str): A multi-line Python snippet. Anything it prints to stdout is
                 returned to you; if it raises, the traceback comes back in stderr.
+            timeout (float): Defaults to 1800 (30 min). Wall-clock seconds before the
+                snippet is killed. Raise it for genuinely long work -- a saddle-point
+                search, a Hessian, a multi-point scan -- rather than trying to move
+                the job off this tool; this is the only sandbox available, and there
+                is no background execution to escape to.
 
         Returns:
-            (str): The captured stdout and stderr. On failure the Python traceback
-                is in the STDERR section -- read it to see why the code failed and
-                revise the snippet.
+            (str): The captured stdout and stderr, clipped to keep the head and tail
+                if very long. On failure the Python traceback is in the STDERR
+                section -- read it to see why the code failed and revise the snippet.
         """
         # Make the project skills' helper scripts importable from the snippet, so the
         # code-gen path can lean on the same vetted helpers the harness surfaces
@@ -195,6 +248,7 @@ class QMToolkit:
             code,
             workdir=self.state.output_path,
             extra_paths=extra_paths,
+            timeout=timeout,
         )
 
         stdout = result.get('stdout', '')
@@ -204,17 +258,20 @@ class QMToolkit:
         # returncode is the authoritative success signal: a raised exception exits
         # non-zero with its traceback on stderr. stderr alone is not treated as
         # failure -- libraries write benign warnings there on a clean (0) run.
+        # Clip both paths: a failing snippet's stdout is just as capable of burying
+        # the traceback (and the context) as a successful one's.
         if returncode not in ('', '0'):
             raise QMToolError(
                 f'Code execution failed (returncode {returncode}).\n'
-                f'--- STDOUT ---\n{stdout or "(empty)"}\n'
-                f'--- STDERR ---\n{stderr or "(empty)"}\n'
+                f'--- STDOUT ---\n{_clip(stdout) or "(empty)"}\n'
+                f'--- STDERR ---\n{_clip(stderr) or "(empty)"}\n'
                 'Read the traceback above, fix the snippet, and try again.'
             )
 
-        out = f'Code executed successfully (returncode {returncode}).\n--- STDOUT ---\n{stdout or "(empty)"}'
+        out = (f'Code executed successfully (returncode {returncode}).\n'
+               f'--- STDOUT ---\n{_clip(stdout) or "(empty)"}')
         if stderr.strip():
-            out += f'\n--- STDERR (warnings) ---\n{stderr}'
+            out += f'\n--- STDERR (warnings) ---\n{_clip(stderr)}'
         return out
 
     async def build_compound(self, smiles: str, max_iters: int = 2000) -> str:
