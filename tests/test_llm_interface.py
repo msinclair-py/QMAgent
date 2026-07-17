@@ -2,7 +2,10 @@
 
 These use pydantic-ai's FunctionModel, so they exercise the real agent -- its
 real capability stack and output contract -- without a provider credential or a
-network call.
+network call. The QM tools themselves live in ``tools.QMToolkit`` and are tested
+in test_tools.py; here we cover what belongs to the pydantic-ai layer: the
+deferred-call guard, credential-free import, lazy caching, and that the shared
+toolkit actually reaches the agent through ``qm_toolset``.
 """
 
 import os
@@ -18,7 +21,7 @@ os.environ.setdefault('OPENAI_API_KEY', 'test-key-not-used')
 from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart  # noqa: E402
 from pydantic_ai.models.function import AgentInfo, FunctionModel  # noqa: E402
 
-from qmagent.llm_interface import QMDeps, orchestrator  # noqa: E402
+from qmagent.llm_interface import QMDeps, orchestrator, qm_toolset  # noqa: E402
 
 
 def test_approval_required_tool_call_does_not_kill_the_run(tmp_path):
@@ -59,61 +62,15 @@ def test_approval_required_tool_call_does_not_kill_the_run(tmp_path):
         # Second turn: having been denied, answer normally.
         return ModelResponse(parts=[TextPart('understood, using run_code instead')])
 
-    deps = QMDeps(qm=None, output_path=tmp_path, resname='LIG')
-
     with orchestrator.override(model=FunctionModel(respond)):
         # The assertion is that this does not raise UserError.
         result = orchestrator.run_sync(
-            'start a long job in the background', deps=deps,
+            'start a long job in the background', deps=QMDeps(),
             output_type=str, toolsets=[extra],
         )
 
     assert calls == ['launch_detached_job'], 'the approval-required tool was never called'
     assert isinstance(result.output, str)
-
-
-def test_run_code_forwards_its_timeout_to_the_agent(tmp_path):
-    """run_code must let the model choose a timeout, and default generously.
-
-    execute_code's own default is 300s, which does not fit real QM: an
-    open-shell TS search plus a Hessian blows straight through it. When the tool
-    hardcoded that default, the model's only way out was to look for background
-    execution -- which is what tripped the approval-required crash. The tool
-    therefore owns the policy and always passes it explicitly.
-    """
-    seen: dict[str, object] = {}
-
-    class _FakeAgent:
-        async def execute_code(self, code, workdir=None, extra_paths=None,
-                               timeout=None):
-            seen.update(code=code, timeout=timeout)
-            return {'stdout': 'ok', 'stderr': '', 'returncode': '0'}
-
-    def respond(messages, info: AgentInfo) -> ModelResponse:
-        if 'timeout' not in seen:
-            return ModelResponse(parts=[ToolCallPart(
-                tool_name='run_code',
-                args={'code': 'print(1)', 'timeout': 5400.0},
-            )])
-        return ModelResponse(parts=[TextPart('done')])
-
-    deps = QMDeps(qm=_FakeAgent(), output_path=tmp_path, resname='LIG')
-    with orchestrator.override(model=FunctionModel(respond)):
-        orchestrator.run_sync('run some code', deps=deps, output_type=str)
-
-    assert seen['timeout'] == 5400.0, 'run_code did not forward the timeout'
-
-
-def test_run_code_default_timeout_fits_real_qm():
-    """The default must be long enough for a saddle-point search plus a Hessian."""
-    import inspect
-
-    from qmagent.llm_interface import run_code
-
-    default = inspect.signature(run_code).parameters['timeout'].default
-    # 300s (execute_code's own default) is empirically too short: an HCN TS
-    # search alone took ~175s at def2-SVP, and CH4 + .OH is far bigger.
-    assert default >= 1800.0
 
 
 def test_denial_message_points_the_model_at_run_code(tmp_path):
@@ -141,7 +98,7 @@ def test_module_imports_without_a_provider_credential():
     The orchestrator used to be constructed at module scope, so `import
     qmagent.llm_interface` called infer_model -> OpenAIProvider() and raised
     UserError on any machine without OPENAI_API_KEY. That made the data models,
-    QMDeps and the tool functions untestable offline, and meant even reading the
+    QMDeps and qm_toolset untestable offline, and meant even reading the
     configured model name needed a credential. Run in a subprocess so the
     module is imported fresh with the key genuinely absent.
     """
@@ -159,11 +116,19 @@ def test_module_imports_without_a_provider_credential():
     assert 'gpt' in proc.stdout
 
 
-def test_all_tools_are_registered_on_the_built_agent():
-    """Every tool must survive the move off @orchestrator.tool decorators."""
-    from qmagent.llm_interface import orchestrator
+def test_qm_toolset_exposes_every_curated_tool():
+    """The shared toolkit must reach the agent through qm_toolset.
 
-    registered = set(orchestrator._function_toolset.tools)
+    The orchestrator is built with capabilities only; the QM tools are supplied
+    per run via ``toolsets=[qm_toolset(toolkit)]`` (they bind to a run's handle,
+    which does not exist at construction). This is the wiring test for that path.
+    """
+    from qmagent.tools import QMRunState, QMToolkit
+
+    from conftest import StubHandle
+
+    toolkit = QMToolkit(QMRunState(qm=StubHandle(), output_path='.', resname='LIG'))
+    registered = set(qm_toolset(toolkit).tools)
     expected = {
         'run_code', 'build_compound', 'geometry_optimization', 'compute_esp',
         'scan_torsions', 'fit_resp_charges', 'integrate_amber_ff',
@@ -177,79 +142,3 @@ def test_orchestrator_is_cached_not_rebuilt():
     import qmagent.llm_interface as li
 
     assert li.orchestrator is li.orchestrator
-
-
-# --------------------------------------------------------------------------- #
-# tool-output clipping
-# --------------------------------------------------------------------------- #
-
-def test_clip_leaves_short_output_untouched():
-    from qmagent.llm_interface import _clip
-
-    assert _clip('E = -76.358207 Ha') == 'E = -76.358207 Ha'
-
-
-def test_clip_keeps_both_ends_and_says_how_much_it_dropped():
-    """QM logs are front- and back-loaded: setup at the top, answer at the bottom."""
-    from qmagent.llm_interface import _clip
-
-    text = 'SETUP-MARKER' + ('x' * 100_000) + 'CONVERGED-MARKER'
-    out = _clip(text, limit=1000)
-
-    assert 'SETUP-MARKER' in out, 'lost the head of the output'
-    assert 'CONVERGED-MARKER' in out, 'lost the tail -- where the answer lives'
-    assert 'clipped' in out
-    assert len(out) < 2000
-    # The model must be able to tell "that was all" from "there was more".
-    assert '100,0' in out or 'characters clipped' in out
-
-
-def test_clip_preserves_a_traceback_tail():
-    """A failing snippet's traceback must survive: it is the whole point of the retry."""
-    from qmagent.llm_interface import _clip
-
-    noise = '\n'.join(f'  cycle {i}  E = -76.35' for i in range(5000))
-    text = noise + '\nTraceback (most recent call last):\nValueError: bad basis'
-    out = _clip(text, limit=1000)
-
-    assert 'ValueError: bad basis' in out
-
-
-def test_run_code_clips_what_it_returns_to_the_model(tmp_path):
-    """A chatty snippet must not put its whole log into the conversation.
-
-    Tool output is re-sent on every later request, so one verbose optimizer log
-    is paid for once per remaining turn -- the compounding that took a real run
-    to 1.53M input tokens, 99% of it re-sent context.
-    """
-    from qmagent.llm_interface import MAX_TOOL_OUTPUT_CHARS
-
-    returned: list[str] = []
-
-    class _FakeAgent:
-        async def execute_code(self, code, workdir=None, extra_paths=None,
-                               timeout=None):
-            # Roughly one real geomeTRIC optimization log, several times over.
-            return {'stdout': 'A' + ('geomeTRIC iteration noise ' * 20_000) + 'Z',
-                    'stderr': '', 'returncode': '0'}
-
-    def respond(messages, info: AgentInfo) -> ModelResponse:
-        for m in messages:
-            for part in getattr(m, 'parts', []) or []:
-                if getattr(part, 'part_kind', '') == 'tool-return':
-                    returned.append(str(part.content))
-        if not returned:
-            return ModelResponse(parts=[ToolCallPart(
-                tool_name='run_code', args={'code': 'print("noisy")'})])
-        return ModelResponse(parts=[TextPart('done')])
-
-    deps = QMDeps(qm=_FakeAgent(), output_path=tmp_path, resname='LIG')
-    with orchestrator.override(model=FunctionModel(respond)):
-        orchestrator.run_sync('run it', deps=deps, output_type=str)
-
-    assert returned, 'run_code never returned anything to the model'
-    body = returned[0]
-    # ~500k chars of stdout must not reach the conversation intact.
-    assert len(body) < MAX_TOOL_OUTPUT_CHARS + 2000, (
-        f'run_code returned {len(body):,} chars unclipped')
-    assert 'clipped' in body

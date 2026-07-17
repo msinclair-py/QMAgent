@@ -3,8 +3,11 @@
 These tests deliberately avoid the heavy runtime dependencies (PySCF/GPU,
 AmberTools, the LLM orchestrator and the parsl/academy distributed layer).
 They exercise the pure-Python logic: file parsing/writing, the pydantic data
-models, the RESP charge fitter and the static helpers on ``QMAgent``.
+models, the RESP charge fitter, the QM tool layer and the static helpers on
+``QMAgent``.
 """
+
+import asyncio
 
 import numpy as np
 import pytest
@@ -12,6 +15,38 @@ from rdkit import Chem
 from rdkit.Chem import AllChem
 
 from qmagent.utils.file_ops import write_mol2
+
+
+def _run(coro):
+    """Drive an async coroutine to completion without a pytest-asyncio plugin.
+
+    The @action methods and tool coroutines are awaitable as-is, so a bare
+    ``asyncio.run`` per test is enough and keeps the suite plugin-free.
+    """
+    return asyncio.run(coro)
+
+
+class StubHandle:
+    """Stands in for the academy Handle to the distributed QMAgent.
+
+    Every attribute resolves to an async action that records its call and returns
+    whatever was registered for that name, so a test can assert on what the tool
+    layer dispatched without a parsl/academy runtime behind it.
+    """
+
+    def __init__(self, **returns):
+        self.calls: list[tuple[str, dict]] = []
+        self._returns = returns
+
+    def __getattr__(self, name: str):
+        async def action(*args, **kwargs):
+            self.calls.append((name, kwargs))
+            return self._returns.get(name)
+        return action
+
+    def kwargs_for(self, name: str) -> dict:
+        """The keyword arguments the toolkit dispatched to ``name``."""
+        return next(kwargs for called, kwargs in self.calls if called == name)
 
 
 @pytest.fixture
