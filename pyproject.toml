@@ -19,6 +19,12 @@ dependencies = [
     "parsl>=2026.6.29",
     "pyyaml>=6.0",
 
+    # --- MCP (externally managed harness) ---
+    # The server half of FastMCP. pydantic-ai already pulls `fastmcp-slim[client]`
+    # for its MCPToolset; `fastmcp` is the same distribution with the client and
+    # server extras, so this adds the server without a second implementation.
+    "fastmcp>=3.4.4",
+
     # --- LLM orchestration (pydantic-ai + ecosystem capabilities) ---
     # pydantic-ai-slim is pulled transitively by pydantic-ai / the harness.
     "pydantic-ai>=2.7",
@@ -31,6 +37,10 @@ dependencies = [
     "pydantic-deep>=0.3.35",             # imported as `pydantic_deep`
     "subagents-pydantic-ai>=0.2.8",
 ]
+
+[project.scripts]
+# So an MCP client can spawn the server without knowing the module path.
+qmagent-mcp = "qmagent.mcp_server:main"
 
 [project.optional-dependencies]
 # Dev/test dependencies. Install (editable) with uv:

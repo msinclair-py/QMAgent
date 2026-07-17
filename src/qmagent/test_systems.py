@@ -31,8 +31,9 @@ from academy.exchange import LocalExchangeFactory
 from academy.manager import Manager
 from concurrent.futures import ThreadPoolExecutor
 
-from .llm_interface import orchestrator, QMDeps
+from .llm_interface import orchestrator, qm_toolset, QMDeps
 from .agents.qm_agent import QMAgent
+from .tools import QMRunState, QMToolkit
 
 
 @dataclass(frozen=True)
@@ -95,15 +96,17 @@ async def run_one(manager: Manager, qm_handle, system: TestSystem,
     """Run the agent on one system. Returns (system, summary, error)."""
     output_path = base_output / system.resname
     output_path.mkdir(parents=True, exist_ok=True)
+    toolkit = QMToolkit(QMRunState(
+        qm=qm_handle,
+        output_path=output_path,
+        resname=system.resname,
+        amberhome=Path(os.environ['AMBERHOME']),
+    ))
     try:
         result = await orchestrator.run(
             f'Can you generate parameters for this compound: {system.smiles}',
-            deps=QMDeps(
-                qm=qm_handle,
-                output_path=output_path,
-                resname=system.resname,
-                amberhome=Path(os.environ['AMBERHOME']),
-            ),
+            deps=QMDeps(),
+            toolsets=[qm_toolset(toolkit)],
         )
         return system, result.output, None
     except Exception as exc:  # keep going so one failure doesn't sink the ladder

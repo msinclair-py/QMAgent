@@ -48,19 +48,32 @@ steps) and as a single deterministic **`run_parameterization_pipeline`** tool
 
 ## Architecture
 
-QMAgent is two cooperating layers:
+QMAgent is three layers, and the top one is swappable.
 
-**1. LLM orchestration** (`src/qmagent/llm_interface.py`, `main.py`)
-A [`pydantic-ai`](https://ai.pydantic.dev/) agent playing "computational
-chemist." Each QM step is a typed tool that returns a short summary string and
-stashes large results as keyed *artifacts* on the run context (`QMDeps`), so the
-model chains steps by passing short keys rather than echoing big structured
-objects. The agent is equipped with a capability stack — tool search, extended
-thinking, context summarization, web search, a read-only filesystem console,
-persistent memory, a `researcher` subagent, a TODO planner, and input/tool/secret
-shields.
+**1. Harness — pick one.** Something has to decide *which* QM step to run next
+and with what settings. That job is either ours or someone else's:
 
-**2. Distributed execution** (`src/qmagent/agents/`, `src/qmagent/utils/`)
+* **Self-managed** (`llm_interface.py`, `main.py`) — a
+  [`pydantic-ai`](https://ai.pydantic.dev/) agent playing "computational chemist",
+  equipped with a capability stack (tool search, extended thinking, context
+  summarization, web search, a read-only filesystem console, persistent memory, a
+  `researcher` subagent, a TODO planner, input/tool/secret shields) and returning a
+  typed `ParameterizationSummary`.
+* **Externally managed** (`mcp_server.py`) — an
+  [MCP](https://modelcontextprotocol.io) server exposing the same tools to a
+  commercial or open-source harness (Claude Code, Codex, …), which brings its own
+  model, context management and UI. This path imports no pydantic-ai at all: no
+  orchestrator, no model config, no API key.
+
+**2. QM tools** (`src/qmagent/tools.py`)
+`QMToolkit` — one method per QM step, dispatching to the distributed agent and
+returning a short summary string while stashing large results as keyed *artifacts*
+on the run state, so a model chains steps by passing short keys rather than echoing
+big structured objects. It imports neither harness; both adapt the same bound
+methods, deriving identical schemas and descriptions from these signatures and
+docstrings. A tool is defined, documented and fixed exactly once.
+
+**3. Distributed execution** (`src/qmagent/agents/`, `src/qmagent/utils/`)
 An [`academy`](https://github.com/proxystore/academy) `QMAgent` whose `@action`
 methods dispatch [`parsl`](https://parsl-project.org/) `@python_app`s. Parsl
 routes work to two executor labels — **`gpu`** (PySCF/gpu4pyscf DFT: geometry
@@ -70,11 +83,19 @@ glue runs alongside. On a laptop the same labels map to local thread pools
 (see *Local vs. HPC* below).
 
 ```
-LLM orchestrator (pydantic-ai)
-        │  academy Handle
-        ▼
-     QMAgent (academy Agent)
-        │  parsl @python_app
+   self-managed                        externally managed
+pydantic-ai agent                 Claude Code / Codex / …
+  (llm_interface)                          │  MCP (stdio or http)
+        │                                  ▼
+        │                            mcp_server.py
+        │                                  │
+        └──────────────┬───────────────────┘
+                       ▼
+             QMToolkit  (tools.py)
+                       │  academy Handle
+                       ▼
+              QMAgent (academy Agent)
+                       │  parsl @python_app
         ├── gpu executor ── PySCF / gpu4pyscf   (geomopt, ESP, torsion scan)
         └── cpu executor ── RDKit, RESP fit, AmberTools (antechamber/parmchk2/tleap/paramfit)
 ```
@@ -127,10 +148,54 @@ export AMBERHOME=/path/to/amber
 uv run python -m qmagent.main
 ```
 
-`main.py` launches a `QMAgent`, then asks the orchestrator to *"generate
-parameters for this compound: CCCCCC"*, writing results under `./qm_output/`.
-Edit the SMILES / residue name there, or drive the orchestrator from your own
-script via `orchestrator.run(prompt, deps=QMDeps(...))`.
+`main.py` launches a `QMAgent`, binds a `QMToolkit` to it, then asks the
+orchestrator to *"generate parameters for this compound: CCCCCC"*, writing results
+under `./qm_output/`. Edit the SMILES / residue name there, or drive the
+orchestrator from your own script:
+
+```python
+toolkit = QMToolkit(QMRunState(qm=qm_handle, output_path=Path('./qm_output'),
+                               resname='LIG', amberhome=Path(os.environ['AMBERHOME'])))
+result = await orchestrator.run(prompt, deps=QMDeps(), toolsets=[qm_toolset(toolkit)])
+```
+
+### Under an external harness (MCP)
+
+To hand the driving over to Claude Code, Codex or any other MCP client instead,
+run the execution layer as an MCP server. The same nine tools, plus the chemist
+prompt our own agent uses and the `skills/` directory as readable resources:
+
+```bash
+uv run python -m qmagent.mcp_server                          # stdio
+uv run python -m qmagent.mcp_server --transport http --port 8000
+uv run python -m qmagent.mcp_server --cpu                    # CPU pyscf, no GPU
+```
+
+One server process is one run scope, so it is configured at startup rather than
+per call — an MCP client spawns the server as a subprocess and reaches it through
+`env`/`args`:
+
+```json
+{"mcpServers": {"qmagent": {
+  "command": "uv",
+  "args": ["run", "python", "-m", "qmagent.mcp_server"],
+  "env": {"QMAGENT_OUTPUT": "./qm_output",
+          "QMAGENT_RESNAME": "LIG",
+          "AMBERHOME": "/path/to/amber"}}}}
+```
+
+| variable | meaning | default |
+|----------|---------|---------|
+| `QMAGENT_OUTPUT`   | run output directory                       | `./qm_output` |
+| `QMAGENT_RESNAME`  | residue name / output basename             | `LIG` |
+| `AMBERHOME`        | AmberTools root (AMBER steps error without) | — |
+| `QMAGENT_GPU`      | `0` to import CPU pyscf instead of gpu4pyscf | on |
+| `QMAGENT_THREADS`  | agent worker threads                        | `os.cpu_count()` |
+| `QMAGENT_EXCHANGE` | `local`, or an academy exchange http(s) URL | `local` |
+| `QMAGENT_SKILLS`   | skills directory served as resources        | `./skills` |
+
+Every flag has a `--flag` equivalent (`--output`, `--resname`, `--cpu`, …) that
+overrides the environment; see `--help`.
 
 ### Live demo — CPU only, no GPU, no AmberTools, no API key
 
@@ -200,8 +265,9 @@ deployments.
 
 ## Skills
 
-`skills/` holds curated, model-loadable domain knowledge (surfaced to the
-orchestrator via the skills capability, and reusable from generated code):
+`skills/` holds curated, model-loadable domain knowledge — surfaced to the
+self-managed orchestrator via the skills capability, served to an external
+harness as `skill://` MCP resources, and reusable from generated code either way:
 
 - **`skills/pyscf/`** — the PySCF / gpu4pyscf workflow this project relies on:
   molecule construction, DFT/SCF, geometry optimization & constrained torsion
@@ -235,7 +301,10 @@ the LLM orchestrator and the parsl/academy runtime, so it runs anywhere.
 src/qmagent/
   main.py                 single-compound entry point (hosted exchange)
   test_systems.py         reference ladder with known parameters
-  llm_interface.py        pydantic-ai orchestrator + one tool per QM step
+  tools.py                QMToolkit: the QM tools, shared by both harnesses
+  llm_interface.py        self-managed harness: pydantic-ai orchestrator
+  mcp_server.py           externally managed harness: MCP server (no pydantic-ai)
+  prompts.py              chemist framing shared by both harnesses
   agents/
     qm_agent.py           academy QMAgent: @action per pipeline step + helpers
     distributed.py        parsl @python_app QM kernels (PySCF/gpu4pyscf, RESP)
