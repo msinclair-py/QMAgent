@@ -277,14 +277,18 @@ def _build_orchestrator() -> PydanticAgent[QMDeps, ParameterizationSummary]:
 
     # Registered here rather than via @orchestrator.tool decorators: the agent
     # no longer exists at module import time.
-    #
-    # Code-execution-only mode: run_code is the SOLE model-facing tool. The
-    # curated tools (build_compound, geometry_optimization, ...) remain defined
-    # in this module and importable/callable from Python (and from inside a
-    # run_code snippet), but are deliberately NOT registered on the orchestrator
-    # so the model can only drive a parameterization by writing Python against
-    # the qmagent package. See tests/test_llm_interface.py.
-    agent.tool(run_code)
+    for tool in (
+        run_code,
+        build_compound,
+        geometry_optimization,
+        compute_esp,
+        scan_torsions,
+        fit_resp_charges,
+        integrate_amber_ff,
+        fit_torsions,
+        run_parameterization_pipeline,
+    ):
+        agent.tool(tool)
 
     return agent
 

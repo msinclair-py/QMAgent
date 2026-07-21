@@ -1,0 +1,344 @@
+"""MCP front-end for a persistent Academy-backed QMAgent.
+
+Run this on the machine that owns the QM environment/GPU allocation.  An MCP
+client on a laptop/login node can then call the tools here; the tools dispatch to
+one long-lived Academy ``QMAgent`` handle instead of spawning a fresh execution
+layer for each calculation.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, AsyncIterator
+
+import numpy as np
+from academy.exchange import LocalExchangeFactory
+from academy.manager import Manager
+from concurrent.futures import ThreadPoolExecutor
+from mcp.server.fastmcp import FastMCP
+
+from .agents.qm_agent import QMAgent
+from .llm_interface import ParameterizationSummary
+from .utils.file_ops import XYZContents
+from .utils.pydantic_models import AMBERConfig, QMConfig, QMExperiment
+
+
+@dataclass
+class QMAgentMCPState:
+    """Runtime state owned by the MCP server lifespan."""
+
+    manager_cm: Any | None = None
+    manager: Manager | None = None
+    executor: ThreadPoolExecutor | None = None
+    qm_handle: Any | None = None
+    num_threads: int = os.cpu_count() or 8
+    max_memory: int = 160_000
+    use_gpu: bool = True
+
+
+STATE = QMAgentMCPState()
+
+
+def _handle() -> Any:
+    """Return the live Academy handle or raise a clear server-side error."""
+    if STATE.qm_handle is None:
+        raise RuntimeError("QMAgent handle is not available; MCP lifespan did not start cleanly")
+    return STATE.qm_handle
+
+
+def _path(value: str | None) -> Path | None:
+    return Path(value).expanduser().resolve() if value else None
+
+
+@asynccontextmanager
+async def lifespan(_: FastMCP) -> AsyncIterator[QMAgentMCPState]:
+    """Launch one persistent QMAgent for the life of the MCP server."""
+    STATE.executor = ThreadPoolExecutor()
+    STATE.manager_cm = await Manager.from_exchange_factory(
+        factory=LocalExchangeFactory(),
+        executors=STATE.executor,
+    )
+    STATE.manager = await STATE.manager_cm.__aenter__()
+    if STATE.manager is None:  # defensive; __aenter__ should always return a Manager
+        raise RuntimeError("Academy Manager did not start")
+    STATE.qm_handle = await STATE.manager.launch(
+        QMAgent(
+            num_threads=STATE.num_threads,
+            max_memory=STATE.max_memory,
+            use_gpu=STATE.use_gpu,
+        )
+    )
+    try:
+        yield STATE
+    finally:
+        if STATE.manager_cm is not None:
+            await STATE.manager_cm.__aexit__(None, None, None)
+        if STATE.executor is not None:
+            STATE.executor.shutdown(wait=True)
+        STATE.qm_handle = None
+        STATE.manager = None
+        STATE.manager_cm = None
+        STATE.executor = None
+
+
+mcp = FastMCP(
+    "qmagent-academy",
+    instructions=(
+        "Persistent MCP facade for an Academy QMAgent. The MCP server should run "
+        "on the compute resource; clients call these tools from a login node or laptop."
+    ),
+    lifespan=lifespan,
+)
+
+
+@mcp.tool()
+async def health() -> dict[str, Any]:
+    """Report whether the persistent Academy QMAgent handle is available."""
+    return {
+        "status": "ready" if STATE.qm_handle is not None else "not_ready",
+        "num_threads": STATE.num_threads,
+        "max_memory_mb": STATE.max_memory,
+        "use_gpu": STATE.use_gpu,
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+        "amberhome": os.environ.get("AMBERHOME"),
+        "pyscf_config_file": os.environ.get("PYSCF_CONFIG_FILE"),
+        "handle_type": type(STATE.qm_handle).__name__ if STATE.qm_handle is not None else None,
+    }
+
+
+@mcp.tool()
+async def execute_code(
+    code: str,
+    workdir: str | None = None,
+    timeout: float = 1800.0,
+    extra_paths: list[str] | None = None,
+) -> dict[str, str]:
+    """Execute Python through the persistent Academy QMAgent handle.
+
+    The snippet runs on the QMAgent side with the same interpreter/environment as
+    the worker, so it sees PySCF/gpu4pyscf/AmberTools exactly as the compute node
+    does. Use ``workdir`` for experiment output isolation.
+    """
+    return await _handle().execute_code(
+        code_snippet=code,
+        workdir=_path(workdir),
+        extra_paths=[Path(p).expanduser().resolve() for p in (extra_paths or [])],
+        timeout=timeout,
+    )
+
+
+@mcp.tool()
+async def build_compound(
+    smiles: str,
+    mol2_file: str,
+    resname: str = "LIG",
+    max_iters: int = 2000,
+) -> str:
+    """Build a 3D mol2 for ``smiles`` on the persistent QMAgent."""
+    await _handle().build_compound(
+        smiles=smiles,
+        mol2_file=Path(mol2_file).expanduser().resolve(),
+        resname=resname,
+        max_iters=max_iters,
+    )
+    return str(Path(mol2_file).expanduser().resolve())
+
+
+@mcp.tool()
+async def find_rotatable_torsions(mol2_file: str) -> list[list[int]]:
+    """Detect QMAgent's scan-worthy rotatable torsions for a mol2 file."""
+    torsions = await _handle().find_rotatable_torsions(
+        Path(mol2_file).expanduser().resolve()
+    )
+    return [list(t) for t in sorted(torsions)]
+
+
+def _qm_config(charge: int, basis: str, functional: str, dispersion: str,
+               grid_level: int) -> QMConfig:
+    return QMConfig(
+        functional=functional,
+        basis=basis,
+        dispersion=dispersion,
+        charge=charge,
+        multiplicity=1,
+        grid_level=grid_level,
+    )
+
+
+@mcp.tool()
+async def run_parameterization(
+    smiles: str,
+    resname: str,
+    charge: int,
+    output_dir: str,
+    basis: str = "def2-svp",
+    functional: str = "b3lyp",
+    dispersion: str = "d3bj",
+    grid_level: int = 3,
+    scan_step: int = 15,
+    max_periodicity: int = 4,
+    delta_resp2: float = 0.5,
+) -> dict[str, Any]:
+    """Run the full parameterization workflow on the persistent QMAgent.
+
+    This is intentionally a coarse-grained MCP tool: the client submits the
+    scientific intent once, then the compute-node server keeps the long-running
+    workflow inside the Academy/QMAgent execution layer.
+    """
+    amberhome = os.environ.get("AMBERHOME")
+    if not amberhome:
+        raise RuntimeError("AMBERHOME is not set in the MCP server environment")
+
+    handle = _handle()
+    out = Path(output_dir).expanduser().resolve()
+    out.mkdir(parents=True, exist_ok=True)
+
+    config = _qm_config(charge, basis, functional, dispersion, grid_level)
+    mol2_file = out / f"{resname}.mol2"
+
+    await handle.build_compound(smiles=smiles, mol2_file=mol2_file, resname=resname)
+
+    geom = await handle.geometry_optimization(
+        mol2_file=mol2_file,
+        output_path=out,
+        optimization_stages=[config],
+    )
+    molecule = XYZContents.from_xyz(geom.xyz_file)
+
+    esp = await handle.compute_ESP_charges(
+        contents=molecule,
+        output_path=out,
+        qm_config=config,
+    )
+
+    torsions = sorted(await handle.find_rotatable_torsions(mol2_file))
+    scans, failed = await handle.scan_torsions(
+        contents=molecule,
+        qm_config=config,
+        output_dir=out,
+        torsions=set(torsions),
+        scan_step=scan_step,
+    )
+
+    resp = await handle.fit_RESP_charges(
+        molecule=molecule,
+        mol2_file=mol2_file,
+        esp_results=esp,
+        qm_config=config,
+        delta_resp2=delta_resp2,
+    )
+    net_charge = int(round(float(np.asarray(resp.charges).sum())))
+
+    resp_file = out / f"{resname}_resp.dat"
+    sdf_file = out / f"{resname}.sdf"
+    await handle.prepare_amber_inputs(
+        charges=np.asarray(resp.charges).ravel().tolist(),
+        mol2_file=mol2_file,
+        charge_file=resp_file,
+        sdf_file=sdf_file,
+    )
+
+    amber_config = AMBERConfig(
+        sdf_file=sdf_file,
+        mol2_file=out / f"{resname}_gaff2.mol2",
+        frcmod_file=out / f"{resname}.frcmod",
+        lib_files=out / f"{resname}.lib",
+        resp_charges=resp_file,
+        prmtop=out / f"{resname}.prmtop",
+        amberhome=Path(amberhome),
+        resname=resname,
+        charge=net_charge,
+    )
+    amber = await handle.integrate_AMBER_ff(amber_config=amber_config)
+
+    fits = await handle.fit_torsions(
+        torsion_scans=scans,
+        amber_config=amber_config,
+        output_dir=out,
+        max_periodicity=max_periodicity,
+    )
+
+    experiment = QMExperiment(
+        smiles=smiles,
+        mol2_file=mol2_file,
+        molecule=molecule,
+        geometry_optimizations=[geom],
+        electrostatic_potential=esp,
+        resp_charges=resp,
+        torsion_scan=scans,
+    )
+    experiment_json = out / "experiment.json"
+    experiment_json.write_text(experiment.model_dump_json(indent=2))
+
+    n_fit = sum(1 for fit in fits.fits if fit.frcmod_file is not None)
+    notes = []
+    if failed:
+        notes.append(f"Incomplete torsion scans: {sorted(failed)}")
+    if n_fit < len(fits.fits):
+        notes.append(f"{len(fits.fits) - n_fit} torsion fit(s) failed")
+
+    summary = ParameterizationSummary(
+        resname=resname,
+        smiles=smiles,
+        final_energy_ha=float(geom.energy),
+        net_charge=net_charge,
+        n_torsions_fit=n_fit,
+        lib_file=amber.lib_file,
+        frcmod_file=amber.frcmod_file,
+        refined_frcmod=fits.refined_frcmod,
+        prmtop=amber.prmtop,
+        experiment_json=experiment_json,
+        notes="; ".join(notes),
+    )
+    (out / "summary.json").write_text(summary.model_dump_json(indent=2))
+    (out / "mcp_run_metadata.json").write_text(json.dumps({
+        "transport": "mcp",
+        "execution_layer": "Academy QMAgent handle",
+        "torsions": [list(t) for t in torsions],
+        "failed_torsions": [list(t) for t in sorted(failed)],
+        "basis": basis,
+        "functional": functional,
+        "dispersion": dispersion,
+        "grid_level": grid_level,
+        "scan_step": scan_step,
+    }, indent=2))
+
+    return summary.model_dump(mode="json")
+
+
+@mcp.tool()
+async def shutdown_note() -> str:
+    """Explain how to stop the long-lived server cleanly."""
+    return "Stop the MCP server process (Ctrl-C or scheduler cancellation); lifespan cleanup tears down the Academy Manager and QMAgent."
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--transport", choices=["stdio", "sse", "streamable-http"], default="stdio")
+    parser.add_argument("--host", default="127.0.0.1", help="Host for HTTP/SSE transports")
+    parser.add_argument("--port", type=int, default=8000, help="Port for HTTP/SSE transports")
+    parser.add_argument("--num-threads", type=int, default=os.cpu_count() or 8)
+    parser.add_argument("--max-memory", type=int, default=160_000, help="PySCF max memory in MB")
+    parser.add_argument("--cpu", action="store_true", help="Run QMAgent with use_gpu=False")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = build_parser().parse_args(argv)
+    STATE.num_threads = args.num_threads
+    STATE.max_memory = args.max_memory
+    STATE.use_gpu = not args.cpu
+
+    # FastMCP stores host/port on the instance settings; set them from CLI before run.
+    mcp.settings.host = args.host
+    mcp.settings.port = args.port
+    mcp.run(transport=args.transport)
+
+
+if __name__ == "__main__":
+    main()
