@@ -25,7 +25,7 @@ def _fake_engine(name: str, tag: str) -> types.ModuleType:
         def __init__(self, mol):
             self.mol = mol
             self.engine = tag
-            self.grids = types.SimpleNamespace(atom_grid=None)
+            self.grids = types.SimpleNamespace(level=None)
 
     dft.RKS = RKS
     mod.dft = dft
@@ -69,7 +69,7 @@ def test_cpu_path_uses_pyscf(fake_engines, qm_config):
     # config was applied to the CPU mean-field
     assert mf.xc == 'b3lyp'
     assert mf.disp == 'd3bj'
-    assert mf.grids.atom_grid == 3
+    assert mf.grids.level == 3
 
 
 def test_gpu_path_uses_gpu4pyscf(fake_engines, qm_config):
