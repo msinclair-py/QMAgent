@@ -81,7 +81,7 @@ def geomopt_app(geom_str: str,
     mf_final = dft.RKS(mol_eq)
     mf_final.xc = qm_config.functional
     mf_final.disp = qm_config.dispersion
-    mf_final.grids.atom_grid = qm_config.grid_level
+    mf_final.grids.level = qm_config.grid_level
     mf_final, e_final = _converge_scf(mf_final, 'geometry-optimization final point')
 
     return OptimizationResult(e_final=e_final, coords=opt_coords)
@@ -248,7 +248,7 @@ def scan_torsions_app(xyz: XYZContents,
 
             mf2.xc = qm_config.functional
             mf2.disp = qm_config.dispersion  # single dispersion source; see note above
-            mf2.grids.atom_grid = qm_config.grid_level
+            mf2.grids.level = qm_config.grid_level
 
             # A non-converged point yields a garbage energy that would distort the
             # torsion surface; _converge_scf raises on failure, which the except
@@ -485,6 +485,6 @@ def load_dft(
 
     mf.xc = qm_config.functional
     mf.disp = qm_config.dispersion
-    mf.grids.atom_grid = qm_config.grid_level
+    mf.grids.level = qm_config.grid_level
 
     return mf
